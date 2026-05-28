@@ -1,0 +1,24 @@
+{
+  "format": 1,
+  "model": "MiniCPM5-1B",
+  "tensors": {
+    "model.embed_tokens.weight": [130560, 1536],
+    "model.layers.*.self_attn.q_proj.weight": [2048, 1536],
+    "model.layers.*.self_attn.k_proj.weight": [256, 1536],
+    "model.layers.*.self_attn.v_proj.weight": [256, 1536],
+    "model.layers.*.self_attn.o_proj.weight": [1536, 2048],
+    "model.layers.*.mlp.gate_proj.weight": [4608, 1536],
+    "model.layers.*.mlp.up_proj.weight": [4608, 1536],
+    "model.layers.*.mlp.down_proj.weight": [1536, 4608],
+    "model.layers.*.input_layernorm.weight": [1536],
+    "model.layers.*.post_attention_layernorm.weight": [1536],
+    "model.norm.weight": [1536],
+    "lm_head.weight": [130560, 1536]
+  },
+  "notes": [
+    "head_dim is explicit and must remain 128",
+    "q_projection_size is num_attention_heads * head_dim = 2048",
+    "kv_projection_size is num_key_value_heads * head_dim = 256",
+    "o_proj input dimension is 2048, not hidden_size"
+  ]
+}

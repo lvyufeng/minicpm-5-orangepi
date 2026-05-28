@@ -1,6 +1,11 @@
 # Build outputs
 /build/*
 !/build/.gitkeep
+/build-*/
+/cmake-build-*/
+/src/csrc/custom_ops/build_out/
+/src/csrc/custom_ops/host_native_tiling/
+/custom_opp_install/
 /dist/
 /out/
 /*.o
