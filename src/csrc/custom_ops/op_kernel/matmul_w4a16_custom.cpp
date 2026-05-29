@@ -11,7 +11,7 @@ using namespace AscendC;
 // Math: out[n] = sum_g scales[g, n] * sum_{k in group g} x[k] * w[k, n]
 //   with w in int8 [-8, 7]. K must be multiple of group_size (128).
 //
-// Inputs (M=1, MiniCPM-V GPTQ shapes; group_size G = 128):
+// Inputs (M=1, GPTQ decode shapes; group_size G = 128):
 //   x       fp16  [1, K]
 //   w       int8  [K/128 * 8 * tilesPerBlock * 128, tileLen]
 //   scales  fp16  [K/G, N]

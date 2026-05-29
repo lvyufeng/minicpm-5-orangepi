@@ -12,26 +12,17 @@
 #include <aclnnop/aclnn_silu.h>
 #include <aclnnop/aclnn_sigmoid.h>
 #include <aclnnop/aclnn_softmax.h>
-#include <aclnnop/aclnn_layer_norm.h>
 #include <aclnnop/aclnn_cast.h>
 #include <aclnnop/aclnn_mean.h>
 #include <aclnnop/aclnn_rsqrt.h>
 #include <aclnnop/aclnn_sub.h>
-#include <aclnnop/aclnn_convolution.h>
-#include <aclnnop/aclnn_gelu_v2.h>
-#include <aclnnop/aclnn_batch_matmul.h>
-#include <aclnnop/aclnn_permute.h>
-#include "aclnn_rms_norm1024_custom.h"
-#include "aclnn_linear_causal_conv_custom.h"
-#include "aclnn_linear_causal_conv_step_custom.h"
+#include "aclnn_logits_top1_custom.h"
 #include "aclnn_matmul_w4a16_custom.h"
 #include "aclnn_matmul_w8a8_i32_custom.h"
 #include "aclnn_w8a8_quantize_custom.h"
 #include "aclnn_w8a8_dequant_custom.h"
-#include "aclnn_linear_gated_delta_rule_custom.h"
-#include "aclnn_linear_gated_delta_rule_step_custom.h"
-#include "aclnn_gated_rms_norm_z_custom.h"
 #include "aclnn_attention_step_custom.h"
+#include "aclnn_rope_cache_write_custom.h"
 #include "aclnn_silu_mul_custom.h"
 #include "aclnn_matmul_vec_custom.h"
 #include "aclnn_matmul_cube_custom.h"
@@ -533,34 +524,6 @@ void softmax_last_dim(const Tensor& self, Tensor& out, aclrtStream stream) {
     run_op("aclnnSoftmax", ws_size, executor, stream, aclnnSoftmax);
 }
 
-void rms_norm1024(const Tensor& x, const Tensor& gamma, Tensor& out,
-                  double epsilon, aclrtStream stream) {
-    if (x.dtype() != DType::Float16 || gamma.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("rms_norm1024 requires fp16 inputs");
-    }
-    if (x.shape() != out.shape()) {
-        throw std::runtime_error("rms_norm1024 x/out shape mismatch");
-    }
-    if (x.shape().empty() || x.shape().back() != 1024) {
-        throw std::runtime_error("rms_norm1024 last dim must be 1024");
-    }
-    if (gamma.shape().size() != 1 || gamma.shape()[0] != 1024) {
-        throw std::runtime_error("rms_norm1024 gamma shape must be [1024]");
-    }
-    AclTensorHandle hx, hg, ho;
-    make_acl_tensor(x, hx);
-    make_acl_tensor(gamma, hg);
-    make_acl_tensor(out, ho);
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnRmsNorm1024CustomGetWorkspaceSize(hx.tensor, hg.tensor, epsilon,
-                                                     ho.tensor, &ws_size, &executor);
-    if (ret != 0) {
-        throw std::runtime_error("aclnnRmsNorm1024CustomGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    run_op("aclnnRmsNorm1024Custom", ws_size, executor, stream, aclnnRmsNorm1024Custom);
-}
-
 void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
               double epsilon, aclrtStream stream) {
     if (x.shape() != out.shape()) {
@@ -581,20 +544,22 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
     std::vector<int64_t> reduce_shape = x.shape();
     reduce_shape.back() = 1;
 
-    Tensor x_sq(x.shape(), x.dtype());
-    x_sq.allocate();
-    Tensor mean_x_sq(reduce_shape, x.dtype());
-    mean_x_sq.allocate();
-    Tensor rstd(reduce_shape, x.dtype());
-    rstd.allocate();
-    Tensor scaled(x.shape(), x.dtype());
-    scaled.allocate();
+    Tensor x_f32(x.shape(), DType::Float32); x_f32.allocate();
+    Tensor gamma_f32(gamma.shape(), DType::Float32); gamma_f32.allocate();
+    cast(x, x_f32, stream);
+    cast(gamma, gamma_f32, stream);
+
+    Tensor x_sq(x.shape(), DType::Float32); x_sq.allocate();
+    Tensor mean_x_sq(reduce_shape, DType::Float32); mean_x_sq.allocate();
+    Tensor rstd(reduce_shape, DType::Float32); rstd.allocate();
+    Tensor scaled(x.shape(), DType::Float32); scaled.allocate();
+    Tensor normed_f32(x.shape(), DType::Float32); normed_f32.allocate();
 
     // 1) x_sq = x * x
     {
         AclTensorHandle hx, hx2, hsq;
-        make_acl_tensor(x, hx);
-        make_acl_tensor(x, hx2);
+        make_acl_tensor(x_f32, hx);
+        make_acl_tensor(x_f32, hx2);
         make_acl_tensor(x_sq, hsq);
         uint64_t ws_size = 0;
         aclOpExecutor* executor = nullptr;
@@ -615,7 +580,7 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         uint64_t ws_size = 0;
         aclOpExecutor* executor = nullptr;
         auto ret = aclnnMeanGetWorkspaceSize(hsq.tensor, dim, true,
-                                             to_acl_dtype(x.dtype()),
+                                             ACL_FLOAT,
                                              hmean.tensor, &ws_size, &executor);
         if (ret != 0) {
             aclDestroyIntArray(dim);
@@ -636,7 +601,6 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         make_acl_tensor(mean_x_sq, hmean_in);
         make_acl_tensor(rstd, hmean_out);
 
-        // 3a) rstd = mean + eps using aclnnAdds (scalar add)
         float eps_f = static_cast<float>(epsilon);
         aclScalar* eps_scalar = aclCreateScalar(&eps_f, ACL_FLOAT);
         if (eps_scalar == nullptr) throw std::runtime_error("rms_norm aclCreateScalar(eps) failed");
@@ -666,7 +630,6 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         aclDestroyScalar(alpha_scalar);
     }
     {
-        // 3b) rstd = rsqrt(rstd)
         AclTensorHandle hin, hout;
         make_acl_tensor(rstd, hin);
         make_acl_tensor(rstd, hout);
@@ -680,7 +643,7 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
     // 4) scaled = x * rstd (broadcast last dim)
     {
         AclTensorHandle hx, hrstd, hout;
-        make_acl_tensor(x, hx);
+        make_acl_tensor(x_f32, hx);
         make_acl_tensor(rstd, hrstd);
         make_acl_tensor(scaled, hout);
         uint64_t ws_size = 0;
@@ -690,93 +653,19 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         run_op("rms_norm Mul(x,rstd)", ws_size, executor, stream, aclnnMul);
     }
 
-    // 5) out = scaled * (1 + gamma) (broadcast last dim)
+    // 5) out = cast(scaled * gamma)
     {
-        Tensor gamma_plus_one(gamma.shape(), gamma.dtype());
-        gamma_plus_one.allocate();
-        AclTensorHandle hg_in, hg_out;
-        make_acl_tensor(gamma, hg_in);
-        make_acl_tensor(gamma_plus_one, hg_out);
-        float one_f = 1.0f;
-        aclScalar* one_scalar = aclCreateScalar(&one_f, ACL_FLOAT);
-        if (one_scalar == nullptr) throw std::runtime_error("rms_norm aclCreateScalar(1) failed");
-        float alpha_f = 1.0f;
-        aclScalar* alpha_scalar = aclCreateScalar(&alpha_f, ACL_FLOAT);
-        if (alpha_scalar == nullptr) {
-            aclDestroyScalar(one_scalar);
-            throw std::runtime_error("rms_norm aclCreateScalar(alpha) failed");
-        }
+        AclTensorHandle hscaled, hgamma, hout;
+        make_acl_tensor(scaled, hscaled);
+        make_acl_tensor(gamma_f32, hgamma);
+        make_acl_tensor(normed_f32, hout);
         uint64_t ws_size = 0;
         aclOpExecutor* executor = nullptr;
-        auto ret = aclnnAddsGetWorkspaceSize(hg_in.tensor, one_scalar, alpha_scalar,
-                                             hg_out.tensor, &ws_size, &executor);
-        if (ret != 0) {
-            aclDestroyScalar(one_scalar);
-            aclDestroyScalar(alpha_scalar);
-            throw std::runtime_error("rms_norm Adds(gamma,1) ws failed: " + std::to_string(ret));
-        }
-        try {
-            run_op("rms_norm Adds(gamma,1)", ws_size, executor, stream, aclnnAdds);
-        } catch (...) {
-            aclDestroyScalar(one_scalar);
-            aclDestroyScalar(alpha_scalar);
-            throw;
-        }
-        aclDestroyScalar(one_scalar);
-        aclDestroyScalar(alpha_scalar);
-
-        AclTensorHandle hscaled, hgo, hout;
-        make_acl_tensor(scaled, hscaled);
-        make_acl_tensor(gamma_plus_one, hgo);
-        make_acl_tensor(out, hout);
-        uint64_t ws_size2 = 0;
-        aclOpExecutor* executor2 = nullptr;
-        auto ret2 = aclnnMulGetWorkspaceSize(hscaled.tensor, hgo.tensor, hout.tensor, &ws_size2, &executor2);
-        if (ret2 != 0) throw std::runtime_error("rms_norm Mul(*,1+gamma) ws failed: " + std::to_string(ret2));
-        run_op("rms_norm Mul(*,1+gamma)", ws_size2, executor2, stream, aclnnMul);
+        auto ret = aclnnMulGetWorkspaceSize(hscaled.tensor, hgamma.tensor, hout.tensor, &ws_size, &executor);
+        if (ret != 0) throw std::runtime_error("rms_norm Mul(*,gamma) ws failed: " + std::to_string(ret));
+        run_op("rms_norm Mul(*,gamma)", ws_size, executor, stream, aclnnMul);
     }
-}
-
-void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias,
-                Tensor& out, double epsilon, aclrtStream stream) {
-    check_same_shape(x, out, "layer_norm");
-    if (x.shape().empty()) {
-        throw std::runtime_error("layer_norm input must have rank >= 1");
-    }
-    if (weight.shape() != bias.shape() || weight.shape().size() != 1) {
-        throw std::runtime_error("layer_norm weight/bias must be 1D and same shape");
-    }
-    if (weight.shape()[0] != x.shape().back()) {
-        throw std::runtime_error("layer_norm hidden mismatch");
-    }
-    AclTensorHandle hx, hw, hb, ho;
-    make_acl_tensor(x, hx);
-    make_acl_tensor(weight, hw);
-    make_acl_tensor(bias, hb);
-    make_acl_tensor(out, ho);
-
-    std::vector<int64_t> normalized = weight.shape();
-    aclIntArray* norm_shape = aclCreateIntArray(normalized.data(), normalized.size());
-    if (norm_shape == nullptr) {
-        throw std::runtime_error("aclCreateIntArray(normalized_shape) failed");
-    }
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnLayerNormGetWorkspaceSize(hx.tensor, norm_shape, hw.tensor, hb.tensor,
-                                              epsilon, ho.tensor, nullptr, nullptr,
-                                              &ws_size, &executor);
-    if (ret != 0) {
-        aclDestroyIntArray(norm_shape);
-        throw std::runtime_error("aclnnLayerNormGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    try {
-        run_op("aclnnLayerNorm", ws_size, executor, stream, aclnnLayerNorm);
-    } catch (...) {
-        aclDestroyIntArray(norm_shape);
-        throw;
-    }
-    aclDestroyIntArray(norm_shape);
+    cast(normed_f32, out, stream);
 }
 
 void cast(const Tensor& self, Tensor& out, aclrtStream stream) {
@@ -895,7 +784,6 @@ void apply_rope_partial(const Tensor& x,
                                    sin_row, half_bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
                   "rope copy sin");
     }
-    check_acl(aclrtSynchronizeStream(stream), "rope gather sync");
 
     // 2) a = x1 * cos, b = x2 * sin, y1 = a - b
     mul(x1, cos_e, a, stream);
@@ -946,86 +834,100 @@ void apply_rope_partial(const Tensor& x,
                       "rope scatter tail");
         }
     }
-    check_acl(aclrtSynchronizeStream(stream), "rope scatter sync");
 }
 
-void linear_causal_conv(const Tensor& x,
-                        const Tensor& weight,
-                        Tensor& out,
-                        aclrtStream stream) {
-    if (x.dtype() != DType::Float16 || weight.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("linear_causal_conv requires fp16 tensors");
+void logits_top1(const Tensor& logits,
+                 int64_t valid,
+                 Tensor& value,
+                 Tensor& index,
+                 aclrtStream stream) {
+    if (logits.dtype() != DType::Float16 || value.dtype() != DType::Float16 || index.dtype() != DType::Int32) {
+        throw std::runtime_error("logits_top1 dtype mismatch");
     }
-    if (x.shape().size() != 2 || out.shape() != x.shape()) {
-        throw std::runtime_error("linear_causal_conv x/out must be same [T, C] shape");
+    if (logits.shape().size() != 2 || logits.shape()[0] != 1 ||
+        value.shape() != std::vector<int64_t>{1} || index.shape() != std::vector<int64_t>{1}) {
+        throw std::runtime_error("logits_top1 shape mismatch");
     }
-    if (!((weight.shape().size() == 2 && weight.shape()[0] == x.shape()[1] && weight.shape()[1] == 4) ||
-          (weight.shape().size() == 3 && weight.shape()[0] == x.shape()[1] && weight.shape()[1] == 1 && weight.shape()[2] == 4))) {
-        throw std::runtime_error("linear_causal_conv weight must be [C,4] or [C,1,4]");
+    if (valid <= 0 || valid > logits.shape()[1]) {
+        throw std::runtime_error("logits_top1 valid out of range");
     }
 
-    AclTensorHandle hx, hw, ho;
-    make_acl_tensor(x, hx);
-    make_acl_tensor(out, ho);
-
-    if (weight.shape().size() == 2) {
-        make_acl_tensor(weight, hw);
-    } else {
-        hw.storage_dims = weight.shape();
-        hw.view_dims = {weight.shape()[0], weight.shape()[2]};
-        hw.strides = {weight.shape()[2], 1};
-        hw.tensor = aclCreateTensor(
-            hw.view_dims.data(), hw.view_dims.size(), to_acl_dtype(weight.dtype()),
-            hw.strides.data(), 0, ACL_FORMAT_ND,
-            hw.storage_dims.data(), hw.storage_dims.size(),
-            weight.data());
-        if (hw.tensor == nullptr) {
-            throw std::runtime_error("aclCreateTensor returned null for linear_causal_conv weight view");
-        }
-    }
+    AclTensorHandle hl, hv, hi;
+    make_acl_tensor(logits, hl);
+    make_acl_tensor(value, hv);
+    make_acl_tensor(index, hi);
 
     uint64_t ws_size = 0;
     aclOpExecutor* executor = nullptr;
-    auto ret = aclnnLinearCausalConvCustomGetWorkspaceSize(hx.tensor, hw.tensor, ho.tensor,
-                                                           &ws_size, &executor);
+    auto ret = aclnnLogitsTop1CustomGetWorkspaceSize(hl.tensor, valid, hv.tensor, hi.tensor, &ws_size, &executor);
     if (ret != 0) {
-        throw std::runtime_error("aclnnLinearCausalConvCustomGetWorkspaceSize failed: " + std::to_string(ret));
+        throw std::runtime_error("aclnnLogitsTop1CustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
-    run_op("aclnnLinearCausalConvCustom", ws_size, executor, stream, aclnnLinearCausalConvCustom);
+    run_op("aclnnLogitsTop1Custom", ws_size, executor, stream, aclnnLogitsTop1Custom);
 }
 
-void linear_causal_conv_step(const Tensor& x,
-                             const Tensor& weight_t,
-                             Tensor& out,
-                             aclrtStream stream) {
-    if (x.dtype() != DType::Float16 || weight_t.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("linear_causal_conv_step requires fp16 tensors");
+void rope_cache_write(const Tensor& q,
+                      const Tensor& k,
+                      const Tensor& v,
+                      Tensor& k_cache,
+                      Tensor& v_cache,
+                      const Tensor& cos_table,
+                      const Tensor& sin_table,
+                      int64_t pos,
+                      int64_t cache_len,
+                      int64_t num_q_heads,
+                      int64_t num_kv_heads,
+                      int64_t head_dim,
+                      int64_t rotary_dim,
+                      Tensor& q_rope,
+                      aclrtStream stream) {
+    if (q.dtype() != DType::Float16 || k.dtype() != DType::Float16 || v.dtype() != DType::Float16 ||
+        k_cache.dtype() != DType::Float16 || v_cache.dtype() != DType::Float16 ||
+        cos_table.dtype() != DType::Float16 || sin_table.dtype() != DType::Float16 ||
+        q_rope.dtype() != DType::Float16) {
+        throw std::runtime_error("rope_cache_write requires fp16 tensors");
     }
-    if (x.shape().size() != 2 || x.shape()[0] != 4) {
-        throw std::runtime_error("linear_causal_conv_step x must be [4, C]");
+    if (q.shape() != std::vector<int64_t>{num_q_heads, head_dim} ||
+        k.shape() != std::vector<int64_t>{num_kv_heads, head_dim} ||
+        v.shape() != std::vector<int64_t>{1, num_kv_heads * head_dim} ||
+        q_rope.shape() != q.shape() ||
+        k_cache.shape().size() != 2 || k_cache.shape()[1] != num_kv_heads * head_dim ||
+        v_cache.shape() != k_cache.shape()) {
+        throw std::runtime_error("rope_cache_write shape mismatch");
     }
-    const int64_t C = x.shape()[1];
-    if (weight_t.shape() != std::vector<int64_t>{4, C}) {
-        throw std::runtime_error("linear_causal_conv_step weight_t must be [4, C]");
+    if (cache_len < 0 || cache_len >= k_cache.shape()[0]) {
+        throw std::runtime_error("rope_cache_write cache_len out of range");
     }
-    if (out.shape() != std::vector<int64_t>{1, C}) {
-        throw std::runtime_error("linear_causal_conv_step out must be [1, C]");
+    if (pos < 0 || rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0) {
+        throw std::runtime_error("rope_cache_write invalid position or rotary dim");
+    }
+    if (cos_table.shape().size() != 2 || sin_table.shape() != cos_table.shape() ||
+        cos_table.shape()[0] <= pos || cos_table.shape()[1] != rotary_dim / 2) {
+        throw std::runtime_error("rope_cache_write table shape mismatch");
     }
 
-    AclTensorHandle hx, hw, ho;
-    make_acl_tensor(x, hx);
-    make_acl_tensor(weight_t, hw);
-    make_acl_tensor(out, ho);
+    AclTensorHandle hq, hk, hv, hkc, hvc, hcos, hsin, hqr;
+    make_acl_tensor(q, hq);
+    make_acl_tensor(k, hk);
+    make_acl_tensor(v, hv);
+    make_acl_tensor(k_cache, hkc);
+    make_acl_tensor(v_cache, hvc);
+    make_acl_tensor(cos_table, hcos);
+    make_acl_tensor(sin_table, hsin);
+    make_acl_tensor(q_rope, hqr);
 
     uint64_t ws_size = 0;
     aclOpExecutor* executor = nullptr;
-    auto ret = aclnnLinearCausalConvStepCustomGetWorkspaceSize(hx.tensor, hw.tensor, ho.tensor,
-                                                                &ws_size, &executor);
+    auto ret = aclnnRopeCacheWriteCustomGetWorkspaceSize(
+        hq.tensor, hk.tensor, hv.tensor, hkc.tensor, hvc.tensor, hcos.tensor, hsin.tensor,
+        pos, cache_len, num_q_heads, num_kv_heads, head_dim, rotary_dim,
+        hqr.tensor, hkc.tensor, hvc.tensor, &ws_size, &executor);
     if (ret != 0) {
-        throw std::runtime_error("aclnnLinearCausalConvStepCustomGetWorkspaceSize failed: " + std::to_string(ret));
+        throw std::runtime_error("aclnnRopeCacheWriteCustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
-    run_op("aclnnLinearCausalConvStepCustom", ws_size, executor, stream, aclnnLinearCausalConvStepCustom);
+    run_op("aclnnRopeCacheWriteCustom", ws_size, executor, stream, aclnnRopeCacheWriteCustom);
 }
+
 
 void matmul_w4a16(const Tensor& x,
                   const Tensor& w_int8,
@@ -1207,393 +1109,6 @@ void w8a8_dequant(const Tensor& acc,
         throw std::runtime_error("aclnnW8a8DequantCustomGetWorkspaceSize failed: " + std::to_string(ret));
     }
     run_op("aclnnW8a8DequantCustom", ws_size, executor, stream, aclnnW8a8DequantCustom);
-}
-
-void linear_gated_delta_rule(const Tensor& mixed,
-                             const Tensor& beta,
-                             const Tensor& decay,
-                             Tensor& scratch,
-                             Tensor& out,
-                             aclrtStream stream) {
-    if (mixed.dtype() != DType::Float16 || beta.dtype() != DType::Float16 ||
-        decay.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("linear_gated_delta_rule requires fp16 tensors");
-    }
-    if (scratch.dtype() != DType::Float32) {
-        throw std::runtime_error("linear_gated_delta_rule scratch must be fp32");
-    }
-    constexpr int64_t kScratchElems = 8 * (128 * 128 + 5 * 128);
-    if (scratch.shape().size() != 1 || scratch.shape()[0] != kScratchElems) {
-        throw std::runtime_error("linear_gated_delta_rule scratch must be [136192] fp32");
-    }
-    if (mixed.shape().size() != 2 || mixed.shape()[1] != 6144) {
-        throw std::runtime_error("linear_gated_delta_rule mixed shape must be [T, 6144]");
-    }
-    if (beta.shape().size() != 2 || beta.shape()[1] != 16 || beta.shape()[0] != mixed.shape()[0]) {
-        throw std::runtime_error("linear_gated_delta_rule beta shape must be [T, 16]");
-    }
-    if (decay.shape() != beta.shape()) {
-        throw std::runtime_error("linear_gated_delta_rule decay shape must match beta");
-    }
-    if (out.shape().size() != 2 || out.shape()[1] != 2048 || out.shape()[0] != mixed.shape()[0]) {
-        throw std::runtime_error("linear_gated_delta_rule out shape must be [T, 2048]");
-    }
-
-    AclTensorHandle hm, hb, hd, hs, ho;
-    make_acl_tensor(mixed, hm);
-    make_acl_tensor(beta, hb);
-    make_acl_tensor(decay, hd);
-    make_acl_tensor(scratch, hs);
-    make_acl_tensor(out, ho);
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnLinearGatedDeltaRuleCustomGetWorkspaceSize(hm.tensor, hb.tensor, hd.tensor, hs.tensor,
-                                                               ho.tensor, &ws_size, &executor);
-    if (ret != 0) {
-        throw std::runtime_error("aclnnLinearGatedDeltaRuleCustomGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    run_op("aclnnLinearGatedDeltaRuleCustom", ws_size, executor, stream, aclnnLinearGatedDeltaRuleCustom);
-}
-
-void linear_gated_delta_rule_step(const Tensor& mixed,
-                                  const Tensor& beta,
-                                  const Tensor& decay,
-                                  Tensor& state,
-                                  Tensor& scratch,
-                                  Tensor& out,
-                                  aclrtStream stream) {
-    if (mixed.dtype() != DType::Float16 || beta.dtype() != DType::Float16 ||
-        decay.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("linear_gated_delta_rule_step requires fp16 mixed/beta/decay/out");
-    }
-    if (state.dtype() != DType::Float32 || scratch.dtype() != DType::Float32) {
-        throw std::runtime_error("linear_gated_delta_rule_step state/scratch must be fp32");
-    }
-    if (mixed.shape() != std::vector<int64_t>{1, 6144}) {
-        throw std::runtime_error("linear_gated_delta_rule_step mixed must be [1, 6144]");
-    }
-    if (beta.shape() != std::vector<int64_t>{1, 16}) {
-        throw std::runtime_error("linear_gated_delta_rule_step beta must be [1, 16]");
-    }
-    if (decay.shape() != std::vector<int64_t>{1, 16}) {
-        throw std::runtime_error("linear_gated_delta_rule_step decay must be [1, 16]");
-    }
-    if (state.shape() != std::vector<int64_t>{16, 128, 128}) {
-        throw std::runtime_error("linear_gated_delta_rule_step state must be [16, 128, 128] fp32");
-    }
-    constexpr int64_t kScratchElems = 8 * 6 * 128;
-    if (scratch.shape().size() != 1 || scratch.shape()[0] != kScratchElems) {
-        throw std::runtime_error("linear_gated_delta_rule_step scratch must be [6144] fp32");
-    }
-    if (out.shape() != std::vector<int64_t>{1, 2048}) {
-        throw std::runtime_error("linear_gated_delta_rule_step out must be [1, 2048]");
-    }
-
-    AclTensorHandle hm, hb, hd, hstate, hscratch, ho;
-    make_acl_tensor(mixed, hm);
-    make_acl_tensor(beta, hb);
-    make_acl_tensor(decay, hd);
-    make_acl_tensor(state, hstate);
-    make_acl_tensor(scratch, hscratch);
-    make_acl_tensor(out, ho);
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnLinearGatedDeltaRuleStepCustomGetWorkspaceSize(hm.tensor, hb.tensor, hd.tensor,
-                                                                    hstate.tensor, hscratch.tensor,
-                                                                    ho.tensor,
-                                                                    &ws_size, &executor);
-    if (ret != 0) {
-        throw std::runtime_error("aclnnLinearGatedDeltaRuleStepCustomGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    run_op("aclnnLinearGatedDeltaRuleStepCustom", ws_size, executor, stream, aclnnLinearGatedDeltaRuleStepCustom);
-}
-
-void gated_rms_norm_z(const Tensor& core,
-                      const Tensor& z_silu,
-                      const Tensor& gamma,
-                      Tensor& out,
-                      aclrtStream stream) {
-    if (core.dtype() != DType::Float16 || z_silu.dtype() != DType::Float16 ||
-        gamma.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("gated_rms_norm_z requires fp16 tensors");
-    }
-    if (core.shape().size() != 2 || core.shape()[1] != 2048) {
-        throw std::runtime_error("gated_rms_norm_z core shape must be [T, 2048]");
-    }
-    if (z_silu.shape() != core.shape()) {
-        throw std::runtime_error("gated_rms_norm_z z_silu shape must match core");
-    }
-    if (out.shape() != core.shape()) {
-        throw std::runtime_error("gated_rms_norm_z out shape must match core");
-    }
-    if (gamma.shape().size() != 1 || gamma.shape()[0] != 128) {
-        throw std::runtime_error("gated_rms_norm_z gamma shape must be [128]");
-    }
-
-    AclTensorHandle hc, hz, hg, ho;
-    make_acl_tensor(core, hc);
-    make_acl_tensor(z_silu, hz);
-    make_acl_tensor(gamma, hg);
-    make_acl_tensor(out, ho);
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnGatedRmsNormZCustomGetWorkspaceSize(hc.tensor, hz.tensor, hg.tensor,
-                                                        ho.tensor, &ws_size, &executor);
-    if (ret != 0) {
-        throw std::runtime_error("aclnnGatedRmsNormZCustomGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    run_op("aclnnGatedRmsNormZCustom", ws_size, executor, stream, aclnnGatedRmsNormZCustom);
-}
-
-// ---- Vision encoder building blocks (Conv2d, GELU, BatchMatMul, linear+bias) ----
-
-void conv2d(const Tensor& input,
-            const Tensor& weight,
-            const Tensor* bias,
-            const std::vector<int64_t>& stride,
-            const std::vector<int64_t>& padding,
-            Tensor& out,
-            aclrtStream stream) {
-    if (input.dtype() != DType::Float16 || weight.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("conv2d requires fp16 tensors");
-    }
-    if (bias != nullptr && bias->dtype() != DType::Float16) {
-        throw std::runtime_error("conv2d bias must be fp16");
-    }
-    if (input.shape().size() != 4 || weight.shape().size() != 4 || out.shape().size() != 4) {
-        throw std::runtime_error("conv2d expects 4D NCHW tensors");
-    }
-    if (stride.size() != 2 || padding.size() != 2) {
-        throw std::runtime_error("conv2d stride/padding must be size 2 (H, W)");
-    }
-
-    auto make_nchw = [](const Tensor& t, AclTensorHandle& h) {
-        h.view_dims = t.shape();
-        h.storage_dims = t.shape();
-        h.strides.assign(t.shape().size(), 1);
-        for (int i = static_cast<int>(t.shape().size()) - 2; i >= 0; --i) {
-            h.strides[i] = h.strides[i + 1] * t.shape()[i + 1];
-        }
-        h.tensor = aclCreateTensor(
-            h.view_dims.data(), h.view_dims.size(), to_acl_dtype(t.dtype()),
-            h.strides.data(), 0, ACL_FORMAT_NCHW,
-            h.storage_dims.data(), h.storage_dims.size(),
-            t.data());
-        if (h.tensor == nullptr) throw std::runtime_error("conv2d aclCreateTensor (NCHW) returned null");
-    };
-
-    AclTensorHandle hi, hw, hb, ho;
-    make_nchw(input, hi);
-    make_nchw(weight, hw);
-    make_nchw(out, ho);
-    if (bias != nullptr) {
-        make_acl_tensor(*bias, hb);  // bias is 1D ND
-    }
-
-    aclIntArray* stride_arr = aclCreateIntArray(stride.data(), stride.size());
-    aclIntArray* pad_arr = aclCreateIntArray(padding.data(), padding.size());
-    std::vector<int64_t> dilation_vec{1, 1};
-    aclIntArray* dilation_arr = aclCreateIntArray(dilation_vec.data(), dilation_vec.size());
-    std::vector<int64_t> output_pad_vec{0, 0};
-    aclIntArray* output_pad_arr = aclCreateIntArray(output_pad_vec.data(), output_pad_vec.size());
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    constexpr int8_t kCubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION
-    auto ret = aclnnConvolutionGetWorkspaceSize(
-        hi.tensor, hw.tensor,
-        bias != nullptr ? hb.tensor : nullptr,
-        stride_arr, pad_arr, dilation_arr,
-        /*transposed=*/false, output_pad_arr, /*groups=*/1,
-        ho.tensor, kCubeMathType, &ws_size, &executor);
-    if (ret != 0) {
-        aclDestroyIntArray(stride_arr); aclDestroyIntArray(pad_arr);
-        aclDestroyIntArray(dilation_arr); aclDestroyIntArray(output_pad_arr);
-        throw std::runtime_error("aclnnConvolutionGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    run_op("aclnnConvolution", ws_size, executor, stream, aclnnConvolution);
-    aclDestroyIntArray(stride_arr);
-    aclDestroyIntArray(pad_arr);
-    aclDestroyIntArray(dilation_arr);
-    aclDestroyIntArray(output_pad_arr);
-}
-
-void gelu(const Tensor& self, bool tanh_approx, Tensor& out, aclrtStream stream) {
-    if (self.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("gelu requires fp16 tensors");
-    }
-    if (self.shape() != out.shape()) {
-        throw std::runtime_error("gelu shape mismatch");
-    }
-    AclTensorHandle hs, ho;
-    make_acl_tensor(self, hs);
-    make_acl_tensor(out, ho);
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    const int64_t approximate = tanh_approx ? 1 : 0;
-    auto ret = aclnnGeluV2GetWorkspaceSize(hs.tensor, approximate, ho.tensor, &ws_size, &executor);
-    if (ret != 0) throw std::runtime_error("aclnnGeluV2GetWorkspaceSize failed: " + std::to_string(ret));
-    run_op("aclnnGeluV2", ws_size, executor, stream, aclnnGeluV2);
-}
-
-void batch_matmul(const Tensor& a, const Tensor& b, Tensor& out, aclrtStream stream) {
-    if (a.dtype() != DType::Float16 || b.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("batch_matmul requires fp16 tensors");
-    }
-    if (a.shape().size() < 3 || b.shape().size() != a.shape().size() || out.shape().size() != a.shape().size()) {
-        throw std::runtime_error("batch_matmul tensors must share rank >= 3");
-    }
-    const int64_t r = a.shape().size();
-    if (a.shape()[r - 1] != b.shape()[r - 2]) {
-        throw std::runtime_error("batch_matmul inner dims mismatch");
-    }
-    if (out.shape()[r - 2] != a.shape()[r - 2] || out.shape()[r - 1] != b.shape()[r - 1]) {
-        throw std::runtime_error("batch_matmul out shape mismatch");
-    }
-    for (int64_t i = 0; i < r - 2; ++i) {
-        if (a.shape()[i] != b.shape()[i] || a.shape()[i] != out.shape()[i]) {
-            throw std::runtime_error("batch_matmul batch dims must broadcast-match");
-        }
-    }
-
-    AclTensorHandle ha, hb, ho;
-    make_acl_tensor(a, ha);
-    make_acl_tensor(b, hb);
-    make_acl_tensor(out, ho);
-
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    constexpr int8_t kCubeMathType = 1;
-    auto ret = aclnnBatchMatMulGetWorkspaceSize(ha.tensor, hb.tensor, ho.tensor, kCubeMathType, &ws_size, &executor);
-    if (ret != 0) throw std::runtime_error("aclnnBatchMatMulGetWorkspaceSize failed: " + std::to_string(ret));
-    run_op("aclnnBatchMatMul", ws_size, executor, stream, aclnnBatchMatMul);
-}
-
-void linear_bias(const Tensor& x,
-                 const Tensor& w,
-                 const Tensor* bias,
-                 Tensor& out,
-                 aclrtStream stream) {
-    matmul_b_transposed(x, w, out, stream);
-    if (bias == nullptr) return;
-    // Broadcast add: bias is [N], out is [..., N]. Use aclnnInplaceAdd which
-    // is the dedicated in-place add API (avoids the kernel-cache corruption
-    // we saw when aliasing input and output through plain aclnnAdd).
-    if (bias->dtype() != DType::Float16) throw std::runtime_error("linear_bias bias must be fp16");
-    if (bias->shape().size() != 1 || bias->shape()[0] != out.shape().back()) {
-        throw std::runtime_error("linear_bias bias must be [N] matching out last dim");
-    }
-    AclTensorHandle ho, hb;
-    make_acl_tensor(out, ho);
-    make_acl_tensor(*bias, hb);
-    float alpha_value = 1.0f;
-    aclScalar* alpha = aclCreateScalar(&alpha_value, ACL_FLOAT);
-    if (alpha == nullptr) throw std::runtime_error("linear_bias aclCreateScalar failed");
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnInplaceAddGetWorkspaceSize(ho.tensor, hb.tensor, alpha, &ws_size, &executor);
-    if (ret != 0) {
-        aclDestroyScalar(alpha);
-        throw std::runtime_error("linear_bias aclnnInplaceAddGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    try {
-        run_op("aclnnInplaceAdd_bias", ws_size, executor, stream, aclnnInplaceAdd);
-    } catch (...) {
-        aclDestroyScalar(alpha);
-        throw;
-    }
-    aclDestroyScalar(alpha);
-}
-
-void permute(const Tensor& self,
-             const std::vector<int64_t>& dims,
-             Tensor& out,
-             aclrtStream stream) {
-    if (self.dtype() != out.dtype()) throw std::runtime_error("permute dtype mismatch");
-    if (dims.size() != self.shape().size()) throw std::runtime_error("permute dims rank mismatch");
-    for (size_t i = 0; i < dims.size(); ++i) {
-        if (out.shape()[i] != self.shape()[dims[i]]) {
-            throw std::runtime_error("permute out shape mismatch");
-        }
-    }
-    AclTensorHandle hs, ho;
-    make_acl_tensor(self, hs);
-    make_acl_tensor(out, ho);
-    aclIntArray* dims_arr = aclCreateIntArray(dims.data(), dims.size());
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnPermuteGetWorkspaceSize(hs.tensor, dims_arr, ho.tensor, &ws_size, &executor);
-    if (ret != 0) {
-        aclDestroyIntArray(dims_arr);
-        throw std::runtime_error("aclnnPermuteGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    try {
-        run_op("aclnnPermute", ws_size, executor, stream, aclnnPermute);
-    } catch (...) {
-        aclDestroyIntArray(dims_arr);
-        throw;
-    }
-    aclDestroyIntArray(dims_arr);
-}
-
-void muls(const Tensor& self, float scalar, Tensor& out, aclrtStream stream) {
-    if (self.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("muls requires fp16 tensors");
-    }
-    if (self.shape() != out.shape()) throw std::runtime_error("muls shape mismatch");
-    AclTensorHandle hs, ho;
-    make_acl_tensor(self, hs);
-    make_acl_tensor(out, ho);
-    aclScalar* s = aclCreateScalar(&scalar, ACL_FLOAT);
-    if (s == nullptr) throw std::runtime_error("muls aclCreateScalar failed");
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnMulsGetWorkspaceSize(hs.tensor, s, ho.tensor, &ws_size, &executor);
-    if (ret != 0) {
-        aclDestroyScalar(s);
-        throw std::runtime_error("aclnnMulsGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    try {
-        run_op("aclnnMuls", ws_size, executor, stream, aclnnMuls);
-    } catch (...) {
-        aclDestroyScalar(s);
-        throw;
-    }
-    aclDestroyScalar(s);
-}
-
-void mean(const Tensor& self,
-          const std::vector<int64_t>& dims,
-          bool keep_dim,
-          Tensor& out,
-          aclrtStream stream) {
-    if (self.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
-        throw std::runtime_error("mean requires fp16 tensors");
-    }
-    AclTensorHandle hs, ho;
-    make_acl_tensor(self, hs);
-    make_acl_tensor(out, ho);
-    aclIntArray* dim_arr = aclCreateIntArray(dims.data(), dims.size());
-    uint64_t ws_size = 0;
-    aclOpExecutor* executor = nullptr;
-    auto ret = aclnnMeanGetWorkspaceSize(hs.tensor, dim_arr, keep_dim,
-                                         to_acl_dtype(self.dtype()),
-                                         ho.tensor, &ws_size, &executor);
-    if (ret != 0) {
-        aclDestroyIntArray(dim_arr);
-        throw std::runtime_error("aclnnMeanGetWorkspaceSize failed: " + std::to_string(ret));
-    }
-    try {
-        run_op("aclnnMean", ws_size, executor, stream, aclnnMean);
-    } catch (...) {
-        aclDestroyIntArray(dim_arr);
-        throw;
-    }
-    aclDestroyIntArray(dim_arr);
 }
 
 }  // namespace minicpmv

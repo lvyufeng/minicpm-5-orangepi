@@ -1,0 +1,13 @@
+{
+  "op": "LogitsTop1Custom",
+  "input_desc": [
+    {"name": "logits", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "value", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "index", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+  ],
+  "attr": [
+    {"name": "valid", "type": "int", "param_type": "required"}
+  ]
+}

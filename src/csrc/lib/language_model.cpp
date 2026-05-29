@@ -5,12 +5,17 @@
 #include "minicpmv/quantized_weight.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace minicpmv {
 
@@ -29,6 +34,52 @@ bool w8a8_decode_enabled() {
     return !mode.empty() && mode != "0" && mode != "false";
 }
 
+bool profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MINICPM_PROFILE");
+        return v != nullptr && *v != '\0' && std::string(v) != "0" && std::string(v) != "false";
+    }();
+    return enabled;
+}
+
+class ProfileScope {
+public:
+    ProfileScope(const char* name, aclrtStream stream) : name_(name), stream_(stream), enabled_(profile_enabled()) {
+        if (enabled_) {
+            check_acl(aclrtSynchronizeStream(stream_), "profile sync start");
+            start_ = Clock::now();
+        }
+    }
+
+    ~ProfileScope() {
+        if (!enabled_) return;
+        auto ret = aclrtSynchronizeStream(stream_);
+        const auto end = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+        if (ret == ACL_SUCCESS) {
+            std::cerr << "# profile " << name_ << " ms=" << ms << '\n';
+        } else {
+            std::cerr << "# profile " << name_ << " sync_error=" << ret << " ms=" << ms << '\n';
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    const char* name_;
+    aclrtStream stream_;
+    bool enabled_;
+    Clock::time_point start_;
+};
+
+bool token_in_mode(const std::string& mode, const char* token) {
+    std::istringstream iss(mode);
+    std::string part;
+    while (std::getline(iss, part, ',')) {
+        if (part == token) return true;
+    }
+    return false;
+}
+
 bool w8a8_policy_allows(const char* token) {
     if (!w8a8_decode_enabled()) return false;
     const std::string& mode = w8a8_decode_mode();
@@ -37,8 +88,14 @@ bool w8a8_policy_allows(const char* token) {
     if (mode == "1" || mode == "selective") {
         return t == "lm_head";
     }
-    return mode.find(t) != std::string::npos;
+    if (token_in_mode(mode, token)) return true;
+    if (t == "q" && token_in_mode(mode, "full_q")) return true;
+    if (t == "k" && token_in_mode(mode, "full_k")) return true;
+    if (t == "v" && token_in_mode(mode, "full_v")) return true;
+    if (t == "o" && token_in_mode(mode, "full_o")) return true;
+    return false;
 }
+
 uint16_t f32_to_f16_bits(float f) {
     uint32_t x;
     std::memcpy(&x, &f, sizeof(x));
@@ -75,12 +132,6 @@ void copy_tensor(const Tensor& src, Tensor& dst, aclrtStream stream) {
     check_acl(aclrtSynchronizeStream(stream), "lm copy_tensor sync");
 }
 
-// Load a 2D matmul weight stored as [N, K] in safetensors and return it as
-// [K, N] (natural layout for our cube matmul fast path). Cube kernel beats
-// aclnnMm 2-7x at M=1 for the shapes we hit at decode time; the host wrapper
-// `matmul_b_transposed` falls back to aclnnMm for shapes the cube can't take.
-// Keeps original layout for shapes the cube fast-path can't accelerate so
-// memory and model-load time aren't wasted on a transpose that won't help.
 Tensor load_matmul_weight_transposed(WeightsIndex& index, const LanguageModelConfig& cfg, int layer, const std::string& suffix) {
     Tensor src = load_layer_weight(index, cfg, layer, suffix);
     if (src.shape().size() != 2) {
@@ -89,18 +140,18 @@ Tensor load_matmul_weight_transposed(WeightsIndex& index, const LanguageModelCon
     const int64_t N = src.shape()[0];
     const int64_t K = src.shape()[1];
     if (N > 16384 || (N % 128) != 0) {
-        return src;  // cube fast-path doesn't apply; keep [N, K]
+        return src;
     }
-    std::vector<uint16_t> hostNK(static_cast<size_t>(N) * K);
-    src.copy_to_host(hostNK.data(), hostNK.size() * sizeof(uint16_t));
-    std::vector<uint16_t> hostKN(static_cast<size_t>(K) * N);
+    std::vector<uint16_t> host_nk(static_cast<size_t>(N) * K);
+    src.copy_to_host(host_nk.data(), host_nk.size() * sizeof(uint16_t));
+    std::vector<uint16_t> host_kn(static_cast<size_t>(K) * N);
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t k = 0; k < K; ++k) {
-            hostKN[k * N + n] = hostNK[n * K + k];
+            host_kn[static_cast<size_t>(k) * N + n] = host_nk[static_cast<size_t>(n) * K + k];
         }
     }
     Tensor dst({K, N}, DType::Float16);
-    dst.copy_from_host(hostKN.data(), hostKN.size() * sizeof(uint16_t));
+    dst.copy_from_host(host_kn.data(), host_kn.size() * sizeof(uint16_t));
     return dst;
 }
 
@@ -124,64 +175,43 @@ const W8A8QuantizedWeight* quant_ptr(const W8A8QuantizedWeight& w) {
     return w.w_int8.data() == nullptr ? nullptr : &w;
 }
 
-// Transpose a causal-conv weight from canonical [C, K=4] (or [C, 1, K]) layout
-// into [K=4, C], so each of the 4 rows holds one tap's weights across all
-// channels — what `linear_causal_conv_step` expects.
-Tensor build_conv_step_weight(const Tensor& conv_w) {
-    const auto& s = conv_w.shape();
-    int64_t C = 0;
-    int64_t K = 0;
-    if (s.size() == 2) { C = s[0]; K = s[1]; }
-    else if (s.size() == 3 && s[1] == 1) { C = s[0]; K = s[2]; }
-    else { throw std::runtime_error("conv weight must be [C, 4] or [C, 1, 4]"); }
-    if (K != 4) throw std::runtime_error("conv step weight expects K=4");
+AttentionDecoderLayerConfig attention_config(const LanguageModelConfig& cfg) {
+    return AttentionDecoderLayerConfig{cfg.num_q_heads, cfg.num_kv_heads,
+                                       cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon};
+}
 
-    std::vector<uint16_t> host_CK(C * K);
-    conv_w.copy_to_host(host_CK.data(), host_CK.size() * sizeof(uint16_t));
-    std::vector<uint16_t> host_KC(K * C);
-    for (int64_t c = 0; c < C; ++c) {
-        for (int64_t k = 0; k < K; ++k) {
-            host_KC[k * C + c] = host_CK[c * K + k];
-        }
+AttentionDecoderLayerWeights attention_weights(const LanguageModelLayerWeights& lw) {
+    return AttentionDecoderLayerWeights{
+        &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
+        &lw.o_w, &lw.gate_w, &lw.up_w, &lw.down_w,
+        quant_ptr(lw.q_q), quant_ptr(lw.k_q), quant_ptr(lw.v_q), quant_ptr(lw.o_q),
+        quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
+        quant_ptr(lw.q_w8), quant_ptr(lw.k_w8), quant_ptr(lw.v_w8), quant_ptr(lw.o_w8),
+        quant_ptr(lw.gate_w8), quant_ptr(lw.up_w8), quant_ptr(lw.down_w8),
+    };
+}
+
+float h16_to_f32(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t out;
+    if (exp == 0) {
+        out = sign;
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + 127 - 15) << 23) | (mant << 13);
     }
-    Tensor dst({K, C}, DType::Float16);
-    dst.copy_from_host(host_KC.data(), host_KC.size() * sizeof(uint16_t));
-    return dst;
+    float f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
 }
 
 }  // namespace
 
-LanguageModelConfig default_minicpmv46_lm_config() {
-    LanguageModelConfig cfg;
-    cfg.layer_types = {
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    };
-    return cfg;
-}
-
 LanguageModelConfig default_minicpm5_1b_lm_config() {
-    LanguageModelConfig cfg;
-    cfg.hidden_size = 1536;
-    cfg.num_q_heads = 16;
-    cfg.num_kv_heads = 2;
-    cfg.head_dim = 128;
-    cfg.rotary_dim = 128;
-    cfg.rope_theta = 5000000.0;
-    cfg.rms_epsilon = 1e-6;
-    cfg.num_layers = 24;
-    cfg.vocab_size = 130560;
-    cfg.layer_types.assign(static_cast<size_t>(cfg.num_layers), "llama_attention");
-    cfg.model_prefix = "model";
-    cfg.embed_weight_name = "model.embed_tokens.weight";
-    cfg.final_norm_weight_name = "model.norm.weight";
-    cfg.lm_head_weight_name = "lm_head.weight";
-    cfg.attention_qk_norm_gate = false;
-    return cfg;
+    return LanguageModelConfig{};
 }
 
 LanguageModelWeights load_language_model_weights(WeightsIndex& index,
@@ -189,79 +219,48 @@ LanguageModelWeights load_language_model_weights(WeightsIndex& index,
     LanguageModelWeights w;
     w.embed = load_weight(index, cfg.embed_weight_name);
     w.final_norm_w = load_weight(index, cfg.final_norm_weight_name);
-    w.layers.resize(cfg.num_layers);
-    const bool use_w8a8 = w8a8_decode_enabled();
+    w.layers.resize(static_cast<size_t>(cfg.num_layers));
+
     for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
-        auto& lw = w.layers[layer];
-        lw.input_norm_w = load_layer_weight(index, cfg, static_cast<int>(layer), "input_layernorm.weight");
-        lw.post_norm_w = load_layer_weight(index, cfg, static_cast<int>(layer), "post_attention_layernorm.weight");
-        lw.gate_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "mlp.gate_proj.weight");
-        lw.up_w   = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "mlp.up_proj.weight");
-        lw.down_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "mlp.down_proj.weight");
-        lw.gate_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "mlp.gate_proj");
-        lw.up_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "mlp.up_proj");
-        lw.down_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "mlp.down_proj");
+        auto& lw = w.layers[static_cast<size_t>(layer)];
+        const int li = static_cast<int>(layer);
+        lw.input_norm_w = load_layer_weight(index, cfg, li, "input_layernorm.weight");
+        lw.post_norm_w = load_layer_weight(index, cfg, li, "post_attention_layernorm.weight");
+        lw.gate_w = load_matmul_weight_transposed(index, cfg, li, "mlp.gate_proj.weight");
+        lw.up_w = load_matmul_weight_transposed(index, cfg, li, "mlp.up_proj.weight");
+        lw.down_w = load_matmul_weight_transposed(index, cfg, li, "mlp.down_proj.weight");
+        lw.q_w = load_matmul_weight_transposed(index, cfg, li, "self_attn.q_proj.weight");
+        lw.k_w = load_matmul_weight_transposed(index, cfg, li, "self_attn.k_proj.weight");
+        lw.v_w = load_matmul_weight_transposed(index, cfg, li, "self_attn.v_proj.weight");
+        lw.o_w = load_matmul_weight_transposed(index, cfg, li, "self_attn.o_proj.weight");
+
+        lw.gate_q = load_layer_w4a16_if_present(index, cfg, li, "mlp.gate_proj");
+        lw.up_q = load_layer_w4a16_if_present(index, cfg, li, "mlp.up_proj");
+        lw.down_q = load_layer_w4a16_if_present(index, cfg, li, "mlp.down_proj");
+        lw.q_q = load_layer_w4a16_if_present(index, cfg, li, "self_attn.q_proj");
+        lw.k_q = load_layer_w4a16_if_present(index, cfg, li, "self_attn.k_proj");
+        lw.v_q = load_layer_w4a16_if_present(index, cfg, li, "self_attn.v_proj");
+        lw.o_q = load_layer_w4a16_if_present(index, cfg, li, "self_attn.o_proj");
+
         if (w8a8_policy_allows("mlp")) {
             lw.gate_w8 = quantize_dense_weight_w8a8(lw.gate_w);
             lw.up_w8 = quantize_dense_weight_w8a8(lw.up_w);
             lw.down_w8 = quantize_dense_weight_w8a8(lw.down_w);
         }
-        if (cfg.layer_types[layer] == "linear_attention") {
-            lw.qkv_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "linear_attn.in_proj_qkv.weight");
-            lw.z_w   = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "linear_attn.in_proj_z.weight");
-            lw.qkv_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "linear_attn.in_proj_qkv");
-            lw.z_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "linear_attn.in_proj_z");
-            lw.a_w = load_layer_weight(index, cfg, static_cast<int>(layer), "linear_attn.in_proj_a.weight");
-            lw.b_w = load_layer_weight(index, cfg, static_cast<int>(layer), "linear_attn.in_proj_b.weight");
-            lw.conv_w = load_layer_weight(index, cfg, static_cast<int>(layer), "linear_attn.conv1d.weight");
-            lw.dt_bias = load_layer_weight(index, cfg, static_cast<int>(layer), "linear_attn.dt_bias");
-            lw.a_log = load_layer_weight(index, cfg, static_cast<int>(layer), "linear_attn.A_log");
-            lw.gated_norm_w = load_layer_weight(index, cfg, static_cast<int>(layer), "linear_attn.norm.weight");
-            lw.out_proj_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "linear_attn.out_proj.weight");
-            lw.out_proj_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "linear_attn.out_proj");
-            if (w8a8_policy_allows("linear_qkv")) {
-                lw.qkv_w8 = quantize_dense_weight_w8a8(lw.qkv_w);
-            }
-            if (w8a8_policy_allows("linear_z")) {
-                lw.z_w8 = quantize_dense_weight_w8a8(lw.z_w);
-            }
-            if (w8a8_policy_allows("linear_out")) {
-                lw.out_proj_w8 = quantize_dense_weight_w8a8(lw.out_proj_w);
-            }
-            lw.conv_w_step_t = build_conv_step_weight(lw.conv_w);
-        } else {
-            lw.q_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "self_attn.q_proj.weight");
-            lw.k_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "self_attn.k_proj.weight");
-            lw.v_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "self_attn.v_proj.weight");
-            lw.o_w = load_matmul_weight_transposed(index, cfg, static_cast<int>(layer), "self_attn.o_proj.weight");
-            lw.q_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "self_attn.q_proj");
-            lw.k_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "self_attn.k_proj");
-            lw.v_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "self_attn.v_proj");
-            lw.o_q = load_layer_w4a16_if_present(index, cfg, static_cast<int>(layer), "self_attn.o_proj");
-            if (w8a8_policy_allows("full_q")) {
-                lw.q_w8 = quantize_dense_weight_w8a8(lw.q_w);
-            }
-            if (w8a8_policy_allows("full_k")) {
-                lw.k_w8 = quantize_dense_weight_w8a8(lw.k_w);
-            }
-            if (w8a8_policy_allows("full_v")) {
-                lw.v_w8 = quantize_dense_weight_w8a8(lw.v_w);
-            }
-            if (w8a8_policy_allows("full_o")) {
-                lw.o_w8 = quantize_dense_weight_w8a8(lw.o_w);
-            }
-            if (cfg.attention_qk_norm_gate) {
-                lw.q_norm_w = load_layer_weight(index, cfg, static_cast<int>(layer), "self_attn.q_norm.weight");
-                lw.k_norm_w = load_layer_weight(index, cfg, static_cast<int>(layer), "self_attn.k_norm.weight");
-            }
+        if (w8a8_policy_allows("q")) {
+            lw.q_w8 = quantize_dense_weight_w8a8(lw.q_w);
+        }
+        if (w8a8_policy_allows("k")) {
+            lw.k_w8 = quantize_dense_weight_w8a8(lw.k_w);
+        }
+        if (w8a8_policy_allows("v")) {
+            lw.v_w8 = quantize_dense_weight_w8a8(lw.v_w);
+        }
+        if (w8a8_policy_allows("o")) {
+            lw.o_w8 = quantize_dense_weight_w8a8(lw.o_w);
         }
     }
 
-    // Pre-build cube-friendly lm_head chunks: [K=hidden, N=16384] per slice,
-    // padded with zero columns if the tail vocab piece is smaller. Cube path
-    // requires N <= 16384 and N % 128 == 0, so a uniform 16384-wide chunk
-    // keeps every slice on the fast path. Padded columns produce a 0 logit
-    // that lm_head_greedy ignores by clipping to start_vocab + valid_n.
     constexpr int64_t kChunkN = 16384;
     const int64_t H = cfg.hidden_size;
     const int64_t V = cfg.vocab_size;
@@ -312,8 +311,8 @@ void build_rope_tables(int64_t T,
             float inv = std::pow(static_cast<float>(cfg.rope_theta),
                                  -2.0f * static_cast<float>(i) / static_cast<float>(cfg.rotary_dim));
             float theta = static_cast<float>(t) * inv;
-            cos_host[t * half + i] = f32_to_f16_bits(std::cos(theta));
-            sin_host[t * half + i] = f32_to_f16_bits(std::sin(theta));
+            cos_host[static_cast<size_t>(t * half + i)] = f32_to_f16_bits(std::cos(theta));
+            sin_host[static_cast<size_t>(t * half + i)] = f32_to_f16_bits(std::sin(theta));
         }
     }
     cos_table = Tensor({T, half}, DType::Float16);
@@ -321,55 +320,6 @@ void build_rope_tables(int64_t T,
     cos_table.copy_from_host(cos_host.data(), cos_host.size() * sizeof(uint16_t));
     sin_table.copy_from_host(sin_host.data(), sin_host.size() * sizeof(uint16_t));
 }
-
-namespace {
-
-void run_layer_step(int64_t layer,
-                    const LanguageModelWeights& w,
-                    const LanguageModelConfig& cfg,
-                    const Tensor& cos_table,
-                    const Tensor& sin_table,
-                    int32_t pos,
-                    int64_t cache_len,
-                    DecodeState& state,
-                    int& full_i,
-                    int& linear_i,
-                    const Tensor& hidden,
-                    Tensor& next,
-                    aclrtStream stream) {
-    const auto& lw = w.layers[layer];
-    if (cfg.layer_types[layer] == "linear_attention") {
-        LinearAttentionDecoderLayerConfig lcfg{cfg.rms_epsilon};
-        LinearAttentionDecoderLayerWeights ww{
-            &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
-            &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
-            &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
-            &lw.conv_w_step_t,
-            quant_ptr(lw.qkv_q), quant_ptr(lw.z_q), quant_ptr(lw.out_proj_q),
-            quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
-            quant_ptr(lw.qkv_w8), quant_ptr(lw.z_w8), quant_ptr(lw.out_proj_w8),
-            quant_ptr(lw.gate_w8), quant_ptr(lw.up_w8), quant_ptr(lw.down_w8),
-        };
-        linear_attention_decoder_layer_step(hidden, ww, lcfg, state.linear[linear_i], next, stream);
-        ++linear_i;
-    } else {
-        FullAttentionDecoderLayerConfig fcfg{cfg.num_q_heads, cfg.num_kv_heads,
-                                             cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon};
-        FullAttentionDecoderLayerWeights ww{
-            &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
-            &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w, &lw.down_w,
-            quant_ptr(lw.q_q), quant_ptr(lw.k_q), quant_ptr(lw.v_q), quant_ptr(lw.o_q),
-            quant_ptr(lw.gate_q), quant_ptr(lw.up_q), quant_ptr(lw.down_q),
-            quant_ptr(lw.q_w8), quant_ptr(lw.k_w8), quant_ptr(lw.v_w8), quant_ptr(lw.o_w8),
-            quant_ptr(lw.gate_w8), quant_ptr(lw.up_w8), quant_ptr(lw.down_w8),
-        };
-        full_attention_decoder_layer_step(hidden, ww, cos_table, sin_table,
-                                          pos, cache_len, fcfg, state.full[full_i], next, stream);
-        ++full_i;
-    }
-}
-
-}  // namespace
 
 Tensor prefill_from_embeddings(const Tensor& prompt_hidden,
                                const LanguageModelWeights& w,
@@ -392,48 +342,34 @@ Tensor prefill_from_embeddings(const Tensor& prompt_hidden,
     if (T > state.max_seq_len) {
         throw std::runtime_error("prefill_from_embeddings T exceeds state.max_seq_len");
     }
+    if (static_cast<int64_t>(state.layers.size()) != cfg.num_layers) {
+        throw std::runtime_error("prefill_from_embeddings state layer count mismatch");
+    }
     if (cos_table.shape()[0] < T) {
         throw std::runtime_error("prefill_from_embeddings cos_table too short");
     }
 
-    Tensor hidden({T, cfg.hidden_size}, DType::Float16); hidden.allocate();
-    Tensor next({T, cfg.hidden_size}, DType::Float16); next.allocate();
-    copy_tensor(prompt_hidden, hidden, stream);
+    Tensor hidden_a({T, cfg.hidden_size}, DType::Float16); hidden_a.allocate();
+    Tensor hidden_b({T, cfg.hidden_size}, DType::Float16); hidden_b.allocate();
+    copy_tensor(prompt_hidden, hidden_a, stream);
+
+    Tensor* in = &hidden_a;
+    Tensor* out = &hidden_b;
 
     std::vector<int32_t> row_to_t(static_cast<size_t>(T));
-    for (int64_t t = 0; t < T; ++t) row_to_t[t] = static_cast<int32_t>(t);
+    for (int64_t t = 0; t < T; ++t) row_to_t[static_cast<size_t>(t)] = static_cast<int32_t>(t);
 
-    LinearAttentionDecoderLayerConfig lcfg{cfg.rms_epsilon};
-    FullAttentionDecoderLayerConfig fcfg{cfg.num_q_heads, cfg.num_kv_heads,
-                                         cfg.head_dim, cfg.rotary_dim, cfg.rms_epsilon};
-
-    int full_i = 0;
-    int linear_i = 0;
+    const AttentionDecoderLayerConfig acfg = attention_config(cfg);
     for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
-        const auto& lw = w.layers[layer];
-        if (cfg.layer_types[layer] == "linear_attention") {
-            LinearAttentionDecoderLayerWeights ww{
-                &lw.input_norm_w, &lw.post_norm_w, &lw.qkv_w, &lw.z_w, &lw.a_w,
-                &lw.b_w, &lw.conv_w, &lw.dt_bias, &lw.a_log, &lw.gated_norm_w,
-                &lw.out_proj_w, &lw.gate_w, &lw.up_w, &lw.down_w,
-            };
-            linear_attention_decoder_layer_with_cache(hidden, ww, lcfg, state.linear[linear_i], next, stream);
-            ++linear_i;
-        } else {
-            FullAttentionDecoderLayerWeights ww{
-                &lw.input_norm_w, &lw.post_norm_w, &lw.q_w, &lw.k_w, &lw.v_w,
-                &lw.o_w, &lw.q_norm_w, &lw.k_norm_w, &lw.gate_w, &lw.up_w, &lw.down_w,
-            };
-            full_attention_decoder_layer_with_cache(hidden, ww, cos_table, sin_table,
-                                                    row_to_t, fcfg, state.full[full_i], next, stream);
-            ++full_i;
-        }
-        copy_tensor(next, hidden, stream);
+        const auto ww = attention_weights(w.layers[static_cast<size_t>(layer)]);
+        attention_decoder_layer_with_cache(*in, ww, cos_table, sin_table,
+                                           row_to_t, acfg, state.layers[static_cast<size_t>(layer)], *out, stream);
+        std::swap(in, out);
     }
     state.seq_len = T;
 
     Tensor last_hidden({1, cfg.hidden_size}, DType::Float16); last_hidden.allocate();
-    copy_row(hidden, T - 1, last_hidden, 0, stream);
+    copy_row(*in, T - 1, last_hidden, 0, stream);
     return last_hidden;
 }
 
@@ -441,6 +377,7 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
                        const LanguageModelWeights& w,
                        const LanguageModelConfig& cfg,
                        aclrtStream stream) {
+    ProfileScope profile("lm_head_greedy", stream);
     if (last_hidden_1xH.shape() != std::vector<int64_t>{1, cfg.hidden_size}) {
         throw std::runtime_error("lm_head_greedy hidden must be [1, hidden_size]");
     }
@@ -450,10 +387,12 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
     Tensor normed({1, cfg.hidden_size}, DType::Float16); normed.allocate();
     rms_norm(last_hidden_1xH, w.final_norm_w, normed, cfg.rms_epsilon, stream);
 
-    // Reusable per-chunk logits buffer and host scratch for the D2H read.
     const int64_t kChunkN = w.lm_head_chunks.front().weight_kn.shape()[1];
     Tensor logits({1, kChunkN}, DType::Float16); logits.allocate();
-    std::vector<uint16_t> logits_host(static_cast<size_t>(kChunkN));
+    Tensor chunk_best_value({1}, DType::Float16); chunk_best_value.allocate();
+    Tensor chunk_best_index({1}, DType::Int32); chunk_best_index.allocate();
+    uint16_t chunk_best_value_host{0};
+    int32_t chunk_best_index_host{0};
 
     const bool use_w8a8 = w8a8_decode_enabled();
     Tensor logits_i32;
@@ -469,23 +408,6 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
         w8a8_quantize(normed, normed_i8, normed_scale, stream);
     }
 
-    auto h2f = [](uint16_t h) -> float {
-        uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
-        uint32_t exp = (h >> 10) & 0x1fu;
-        uint32_t mant = h & 0x03ffu;
-        uint32_t out;
-        if (exp == 0) {
-            out = sign;
-        } else if (exp == 31) {
-            out = sign | 0x7f800000u | (mant << 13);
-        } else {
-            out = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-        float f;
-        std::memcpy(&f, &out, sizeof(f));
-        return f;
-    };
-
     int64_t best_token = 0;
     float best_logit = -std::numeric_limits<float>::infinity();
 
@@ -496,14 +418,14 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
         } else {
             matmul_b_transposed(normed, chunk.weight_kn, logits, stream);
         }
-        logits.copy_to_host(logits_host.data(), logits_host.size() * sizeof(uint16_t));
         const int64_t valid = std::min<int64_t>(kChunkN, cfg.vocab_size - chunk.start_vocab);
-        for (int64_t i = 0; i < valid; ++i) {
-            float v = h2f(logits_host[static_cast<size_t>(i)]);
-            if (v > best_logit) {
-                best_logit = v;
-                best_token = chunk.start_vocab + i;
-            }
+        logits_top1(logits, valid, chunk_best_value, chunk_best_index, stream);
+        chunk_best_value.copy_to_host(&chunk_best_value_host, sizeof(chunk_best_value_host));
+        chunk_best_index.copy_to_host(&chunk_best_index_host, sizeof(chunk_best_index_host));
+        float v = h16_to_f32(chunk_best_value_host);
+        if (v > best_logit) {
+            best_logit = v;
+            best_token = chunk.start_vocab + chunk_best_index_host;
         }
     }
     return best_token;
@@ -516,23 +438,41 @@ int64_t decode_step_greedy(int32_t token_id,
                            const Tensor& sin_table,
                            DecodeState& state,
                            aclrtStream stream) {
+    ProfileScope profile("decode_step_greedy", stream);
     if (state.seq_len >= state.max_seq_len) {
         throw std::runtime_error("decode_step_greedy state full");
     }
-    Tensor hidden({1, cfg.hidden_size}, DType::Float16); hidden.allocate();
-    Tensor next({1, cfg.hidden_size}, DType::Float16); next.allocate();
-    embedding_lookup(w.embed, {token_id}, hidden, stream);
+    if (static_cast<int64_t>(state.layers.size()) != cfg.num_layers) {
+        throw std::runtime_error("decode_step_greedy state layer count mismatch");
+    }
 
-    int full_i = 0;
-    int linear_i = 0;
+    Tensor hidden_a({1, cfg.hidden_size}, DType::Float16); hidden_a.allocate();
+    Tensor hidden_b({1, cfg.hidden_size}, DType::Float16); hidden_b.allocate();
+    {
+        ProfileScope profile_embed("decode.embedding", stream);
+        embedding_lookup(w.embed, {token_id}, hidden_a, stream);
+    }
+
+    Tensor* in = &hidden_a;
+    Tensor* out = &hidden_b;
+
+    const AttentionDecoderLayerConfig acfg = attention_config(cfg);
     for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
-        run_layer_step(layer, w, cfg, cos_table, sin_table,
-                       static_cast<int32_t>(state.seq_len), state.seq_len,
-                       state, full_i, linear_i, hidden, next, stream);
-        copy_tensor(next, hidden, stream);
+        const auto ww = attention_weights(w.layers[static_cast<size_t>(layer)]);
+        const auto layer_start = std::chrono::steady_clock::now();
+        attention_decoder_layer_step(*in, ww, cos_table, sin_table,
+                                     static_cast<int32_t>(state.seq_len), state.seq_len,
+                                     acfg, state.layers[static_cast<size_t>(layer)], *out, stream);
+        std::swap(in, out);
+        if (profile_enabled()) {
+            check_acl(aclrtSynchronizeStream(stream), "profile decode layer sync");
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - layer_start).count();
+            std::cerr << "# profile decode.layer." << layer << " ms=" << ms << '\n';
+        }
     }
     ++state.seq_len;
-    return lm_head_greedy(hidden, w, cfg, stream);
+    return lm_head_greedy(*in, w, cfg, stream);
 }
 
 bool is_eos(int64_t token_id, const std::vector<int64_t>& eos_token_ids) {

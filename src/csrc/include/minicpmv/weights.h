@@ -12,6 +12,7 @@ namespace minicpmv {
 struct TensorInfo {
     DType dtype;
     std::vector<int64_t> shape;
+    std::string path;
     uint64_t data_begin;
     uint64_t data_end;
 };
@@ -29,11 +30,10 @@ public:
     Tensor load_to_device_as(const std::string& name, DType target_dtype) const;
 
 private:
-    std::string path_;
-    std::vector<uint8_t> file_bytes_;
+    std::vector<std::string> paths_;
     std::unordered_map<std::string, TensorInfo> tensors_;
 
-    void parse();
+    void parse_file(const std::string& path);
 };
 
 // Resolve the path to a MiniCPM5 safetensors file or snapshot directory used by tools.

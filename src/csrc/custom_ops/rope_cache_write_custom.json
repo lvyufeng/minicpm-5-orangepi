@@ -1,0 +1,25 @@
+{
+  "op": "RopeCacheWriteCustom",
+  "input_desc": [
+    {"name": "q",         "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "k",         "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "v",         "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "k_cache",   "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "v_cache",   "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "cos_table", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "sin_table", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "output_desc": [
+    {"name": "q_rope",      "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "k_cache_out", "param_type": "required", "format": ["ND"], "type": ["float16"]},
+    {"name": "v_cache_out", "param_type": "required", "format": ["ND"], "type": ["float16"]}
+  ],
+  "attr": [
+    {"name": "pos",          "type": "int", "param_type": "required"},
+    {"name": "cache_len",    "type": "int", "param_type": "required"},
+    {"name": "num_q_heads",  "type": "int", "param_type": "required"},
+    {"name": "num_kv_heads", "type": "int", "param_type": "required"},
+    {"name": "head_dim",     "type": "int", "param_type": "required"},
+    {"name": "rotary_dim",   "type": "int", "param_type": "required"}
+  ]
+}

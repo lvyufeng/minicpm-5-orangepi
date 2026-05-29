@@ -22,6 +22,8 @@
 !/cache/.gitkeep
 /checkpoints/
 /weights/
+/models/*
+!/models/.gitkeep
 /*.safetensors
 /*.bin
 /*.gguf
@@ -52,6 +54,7 @@ venv/
 compile_commands.json
 .cache/
 .ccls-cache/
+/.claude/worktrees/
 
 # Editors and OS
 .vscode/

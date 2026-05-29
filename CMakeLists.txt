@@ -43,7 +43,6 @@ if(MINICPM5_ENABLE_ENGINE)
     src/csrc/lib/quantized_weight.cpp
     src/csrc/lib/decoder_layer.cpp
     src/csrc/lib/language_model.cpp
-    src/csrc/lib/vision.cpp
   )
 
   target_include_directories(minicpmv_engine PUBLIC
@@ -67,9 +66,6 @@ if(MINICPM5_ENABLE_ENGINE)
   target_link_options(minicpmv_engine PUBLIC
     "-Wl,-rpath,${CUSTOM_OPP_VENDOR}/op_api/lib"
   )
-
-  add_executable(minicpmv_hybrid_decode src/csrc/tools/minicpmv_hybrid_decode.cpp)
-  target_link_libraries(minicpmv_hybrid_decode PRIVATE minicpmv_engine)
 
   add_executable(minicpm5_decode src/csrc/tools/minicpm5_decode.cpp)
   target_link_libraries(minicpm5_decode PRIVATE minicpmv_engine)

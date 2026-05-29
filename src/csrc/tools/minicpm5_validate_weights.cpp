@@ -34,7 +34,7 @@ void expect_shape(const WeightsIndex& index, const std::string& name, const std:
 }
 
 void usage(const char* argv0) {
-    std::cerr << "usage: " << argv0 << " <model.safetensors>\n";
+    std::cerr << "usage: " << argv0 << " <model.safetensors|model.safetensors.index.json|snapshot-dir>\n";
 }
 
 }  // namespace

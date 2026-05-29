@@ -6,8 +6,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace minicpmv {
@@ -193,19 +195,220 @@ void skip_json_value(const std::string& s, size_t& i) {
     }
 }
 
-}  // namespace
+struct SafetensorsHeader {
+    std::string json;
+    uint64_t data_base;
+    uint64_t file_size;
+};
 
-WeightsIndex::WeightsIndex(const std::string& safetensors_path) : path_(resolve_safetensors_path(safetensors_path)) {
-    std::ifstream in(path_, std::ios::binary);
+SafetensorsHeader read_safetensors_header(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
     if (!in) {
-        throw std::runtime_error("failed to open safetensors file: " + path_);
+        throw std::runtime_error("failed to open safetensors file: " + path);
+    }
+    in.seekg(0, std::ios::end);
+    auto file_size = static_cast<uint64_t>(in.tellg());
+    if (file_size < 8) {
+        throw std::runtime_error("invalid safetensors file: " + path);
+    }
+    in.seekg(0, std::ios::beg);
+    uint64_t header_len = 0;
+    in.read(reinterpret_cast<char*>(&header_len), sizeof(uint64_t));
+    if (!in || 8 + header_len > file_size) {
+        throw std::runtime_error("invalid safetensors header length: " + path);
+    }
+    std::string header(static_cast<size_t>(header_len), '\0');
+    if (header_len != 0) {
+        in.read(&header[0], static_cast<std::streamsize>(header.size()));
+        if (!in) {
+            throw std::runtime_error("failed to read safetensors header: " + path);
+        }
+    }
+    return SafetensorsHeader{std::move(header), 8 + header_len, file_size};
+}
+
+std::vector<uint8_t> read_file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("failed to open file: " + path);
     }
     in.seekg(0, std::ios::end);
     auto size = static_cast<size_t>(in.tellg());
     in.seekg(0, std::ios::beg);
-    file_bytes_.resize(size);
-    in.read(reinterpret_cast<char*>(file_bytes_.data()), static_cast<std::streamsize>(size));
-    parse();
+    std::vector<uint8_t> bytes(size);
+    if (size != 0) {
+        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+        if (!in) {
+            throw std::runtime_error("failed to read file: " + path);
+        }
+    }
+    return bytes;
+}
+
+std::vector<uint8_t> read_file_range(const std::string& path, uint64_t begin, uint64_t end) {
+    if (end < begin) {
+        throw std::runtime_error("invalid safetensors data offsets in " + path);
+    }
+    uint64_t bytes_u64 = end - begin;
+    if (bytes_u64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error("tensor too large to load from " + path);
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("failed to open safetensors file: " + path);
+    }
+    in.seekg(0, std::ios::end);
+    auto file_size = static_cast<uint64_t>(in.tellg());
+    if (end > file_size) {
+        throw std::runtime_error("safetensors tensor range exceeds file size: " + path);
+    }
+    in.seekg(static_cast<std::streamoff>(begin), std::ios::beg);
+    std::vector<uint8_t> bytes(static_cast<size_t>(bytes_u64));
+    if (!bytes.empty()) {
+        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!in) {
+            throw std::runtime_error("failed to read tensor bytes from " + path);
+        }
+    }
+    return bytes;
+}
+
+std::vector<std::string> parse_safetensors_weight_map_files(const std::string& index_path) {
+    std::vector<uint8_t> bytes = read_file_bytes(index_path);
+    std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    size_t i = 0;
+    std::vector<std::string> files;
+    std::unordered_set<std::string> seen;
+
+    expect(json, i, '{');
+    skip_ws(json, i);
+    if (i < json.size() && json[i] == '}') {
+        return files;
+    }
+    while (true) {
+        std::string key = parse_string(json, i);
+        expect(json, i, ':');
+        if (key == "weight_map") {
+            expect(json, i, '{');
+            skip_ws(json, i);
+            if (i < json.size() && json[i] == '}') {
+                ++i;
+            } else {
+                while (true) {
+                    (void)parse_string(json, i);
+                    expect(json, i, ':');
+                    std::string file = parse_string(json, i);
+                    if (seen.insert(file).second) {
+                        files.push_back(std::move(file));
+                    }
+                    skip_ws(json, i);
+                    if (i < json.size() && json[i] == ',') {
+                        ++i;
+                        continue;
+                    }
+                    break;
+                }
+                expect(json, i, '}');
+            }
+        } else {
+            skip_json_value(json, i);
+        }
+        skip_ws(json, i);
+        if (i < json.size() && json[i] == ',') {
+            ++i;
+            continue;
+        }
+        break;
+    }
+    expect(json, i, '}');
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+std::vector<std::string> resolve_safetensors_paths(const std::string& path) {
+    namespace fs = std::filesystem;
+    fs::path p(path);
+    if (fs::is_regular_file(p)) {
+        if (p.filename() == "model.safetensors.index.json") {
+            std::vector<std::string> files;
+            for (const auto& file : parse_safetensors_weight_map_files(p.string())) {
+                fs::path shard = p.parent_path() / file;
+                if (!fs::is_regular_file(shard)) {
+                    throw std::runtime_error("safetensors index references missing shard: " + shard.string());
+                }
+                files.push_back(shard.string());
+            }
+            if (files.empty()) {
+                throw std::runtime_error("safetensors index has no weight_map entries: " + p.string());
+            }
+            return files;
+        }
+        return {p.string()};
+    }
+    if (!fs::is_directory(p)) {
+        return {path};
+    }
+
+    fs::path index_path = p / "model.safetensors.index.json";
+    if (fs::is_regular_file(index_path)) {
+        std::vector<std::string> files;
+        for (const auto& file : parse_safetensors_weight_map_files(index_path.string())) {
+            fs::path shard = p / file;
+            if (!fs::is_regular_file(shard)) {
+                throw std::runtime_error("safetensors index references missing shard: " + shard.string());
+            }
+            files.push_back(shard.string());
+        }
+        if (files.empty()) {
+            throw std::runtime_error("safetensors index has no weight_map entries: " + index_path.string());
+        }
+        return files;
+    }
+
+    const std::vector<std::string> candidates = {
+        "model.safetensors",
+        "model-00000-of-00001.safetensors",
+    };
+    for (const auto& name : candidates) {
+        fs::path candidate = p / name;
+        if (fs::is_regular_file(candidate)) {
+            return {candidate.string()};
+        }
+    }
+
+    std::vector<fs::path> shards;
+    for (const auto& entry : fs::directory_iterator(p)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
+            shards.push_back(entry.path());
+        }
+    }
+    std::sort(shards.begin(), shards.end());
+    if (shards.empty()) {
+        throw std::runtime_error("expected a safetensors file or snapshot directory: " + path);
+    }
+    std::vector<std::string> files;
+    files.reserve(shards.size());
+    for (const auto& shard : shards) {
+        files.push_back(shard.string());
+    }
+    return files;
+}
+
+size_t tensor_numel(const std::vector<int64_t>& shape) {
+    size_t n = 1;
+    for (auto d : shape) n *= static_cast<size_t>(d);
+    return n;
+}
+
+}  // namespace
+
+WeightsIndex::WeightsIndex(const std::string& safetensors_path) : paths_(resolve_safetensors_paths(safetensors_path)) {
+    if (paths_.empty()) {
+        throw std::runtime_error("no safetensors files resolved from: " + safetensors_path);
+    }
+    for (const auto& path : paths_) {
+        parse_file(path);
+    }
 }
 
 const TensorInfo& WeightsIndex::at(const std::string& name) const {
@@ -230,8 +433,11 @@ Tensor WeightsIndex::load_to_device(const std::string& name) const {
     const auto& info = at(name);
     Tensor tensor(info.shape, info.dtype);
     tensor.allocate();
-    const uint8_t* base = file_bytes_.data();
-    tensor.copy_from_host(base + info.data_begin, info.data_end - info.data_begin);
+    std::vector<uint8_t> bytes = read_file_range(info.path, info.data_begin, info.data_end);
+    if (bytes.size() != tensor.size_bytes()) {
+        throw std::runtime_error("safetensors byte size mismatch for " + name);
+    }
+    tensor.copy_from_host(bytes.data(), bytes.size());
     return tensor;
 }
 
@@ -244,14 +450,14 @@ Tensor WeightsIndex::load_to_device_as(const std::string& name, DType target_dty
         throw std::runtime_error("unsupported dtype conversion in load_to_device_as");
     }
 
-    const size_t numel = [&]() {
-        size_t n = 1;
-        for (auto d : info.shape) n *= static_cast<size_t>(d);
-        return n;
-    }();
+    const size_t numel = tensor_numel(info.shape);
+    std::vector<uint8_t> bytes = read_file_range(info.path, info.data_begin, info.data_end);
+    if (bytes.size() != numel * dtype_size(info.dtype)) {
+        throw std::runtime_error("safetensors byte size mismatch for " + name);
+    }
 
     std::vector<uint16_t> converted(numel);
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(file_bytes_.data() + info.data_begin);
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(bytes.data());
     for (size_t i = 0; i < numel; ++i) {
         converted[i] = bf16_bits_to_f16_bits(src[i]);
     }
@@ -262,17 +468,10 @@ Tensor WeightsIndex::load_to_device_as(const std::string& name, DType target_dty
     return tensor;
 }
 
-void WeightsIndex::parse() {
-    if (file_bytes_.size() < 8) {
-        throw std::runtime_error("invalid safetensors file");
-    }
-    uint64_t header_len = 0;
-    std::memcpy(&header_len, file_bytes_.data(), sizeof(uint64_t));
-    if (8 + header_len > file_bytes_.size()) {
-        throw std::runtime_error("invalid safetensors header length");
-    }
-    std::string header(reinterpret_cast<const char*>(file_bytes_.data() + 8), static_cast<size_t>(header_len));
-    uint64_t data_base = 8 + header_len;
+void WeightsIndex::parse_file(const std::string& path) {
+    SafetensorsHeader st = read_safetensors_header(path);
+    const std::string& header = st.json;
+    const uint64_t data_base = st.data_base;
 
     size_t i = 0;
     expect(header, i, '{');
@@ -290,6 +489,7 @@ void WeightsIndex::parse() {
         } else {
             expect(header, i, '{');
             TensorInfo info{};
+            info.path = path;
             bool have_dtype = false, have_shape = false, have_offsets = false;
             while (true) {
                 std::string key = parse_string(header, i);
@@ -322,7 +522,12 @@ void WeightsIndex::parse() {
             if (!have_dtype || !have_shape || !have_offsets) {
                 throw std::runtime_error("incomplete tensor entry for " + tensor_name);
             }
-            tensors_.emplace(std::move(tensor_name), std::move(info));
+            if (info.data_end > st.file_size) {
+                throw std::runtime_error("tensor data range exceeds safetensors file for " + tensor_name);
+            }
+            if (!tensors_.emplace(tensor_name, std::move(info)).second) {
+                throw std::runtime_error("duplicate tensor in safetensors shards: " + tensor_name);
+            }
         }
         skip_ws(header, i);
         if (i < header.size() && header[i] == ',') {
@@ -335,37 +540,11 @@ void WeightsIndex::parse() {
 }
 
 std::string resolve_safetensors_path(const std::string& path) {
-    namespace fs = std::filesystem;
-    fs::path p(path);
-    if (fs::is_regular_file(p)) {
-        return p.string();
+    std::vector<std::string> paths = resolve_safetensors_paths(path);
+    if (paths.size() == 1) {
+        return paths.front();
     }
-    if (!fs::is_directory(p)) {
-        return path;
-    }
-
-    const std::vector<std::string> candidates = {
-        "model.safetensors",
-        "model-00000-of-00001.safetensors",
-    };
-    for (const auto& name : candidates) {
-        fs::path candidate = p / name;
-        if (fs::is_regular_file(candidate)) {
-            return candidate.string();
-        }
-    }
-
-    std::vector<fs::path> shards;
-    for (const auto& entry : fs::directory_iterator(p)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
-            shards.push_back(entry.path());
-        }
-    }
-    std::sort(shards.begin(), shards.end());
-    if (shards.size() == 1) {
-        return shards.front().string();
-    }
-    throw std::runtime_error("expected a safetensors file or a directory with exactly one safetensors shard: " + path);
+    return path;
 }
 
 std::string default_safetensors_path() {
