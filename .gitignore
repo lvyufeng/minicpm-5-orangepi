@@ -1,11 +1,8 @@
 # Build outputs
-/build/*
-!/build/.gitkeep
+/build/
 /build-*/
+/build-engine/
 /cmake-build-*/
-/src/csrc/custom_ops/build_out/
-/src/csrc/custom_ops/host_native_tiling/
-/custom_opp_install/
 /dist/
 /out/
 /*.o
@@ -15,15 +12,17 @@
 /*.dll
 /*.exe
 
-# Generated model artifacts
-/artifacts/*
-!/artifacts/.gitkeep
-/cache/*
-!/cache/.gitkeep
+# Ascend custom op generated/install outputs
+/custom_opp_install/
+/src/csrc/custom_ops/build_out/
+/src/csrc/custom_ops/host_native_tiling/
+
+# Generated model artifacts and local weights
+/artifacts/
+/cache/
+/models/
 /checkpoints/
 /weights/
-/models/*
-!/models/.gitkeep
 /*.safetensors
 /*.bin
 /*.gguf
@@ -31,6 +30,20 @@
 /*.pte
 /*.pt
 /*.pth
+
+# Placeholder/workspace directories not used by the MiniCPM5 text runtime
+/cmake/
+/data/
+/docs/
+/kernels/
+/third_party/
+/tools/
+/vendor/
+/src/backends/
+/src/kernels/
+/src/models/
+/src/runtime/
+/tests/
 
 # Runtime data
 /logs/
