@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniCPM5-1B OrangePi Demo</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#11182d; --muted:#8ea0c4; --text:#edf2ff; --accent:#7c9cff; --border:#24314f; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at top, #172347, var(--bg)); color:var(--text); }
+    .app { max-width: 980px; margin: 0 auto; min-height: 100vh; display:flex; flex-direction:column; padding: 20px; gap: 16px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    h1 { margin:0; font-size: 24px; letter-spacing: -0.02em; }
+    .sub { color:var(--muted); font-size: 13px; margin-top: 4px; }
+    .badge { border:1px solid var(--border); background: rgba(124,156,255,0.12); color:#cdd8ff; padding:7px 10px; border-radius:999px; font-size:12px; }
+    .layout { display:grid; grid-template-columns: 1fr 260px; gap:16px; flex:1; min-height:0; }
+    .chat, .settings { background:rgba(17,24,45,0.86); border:1px solid var(--border); border-radius:18px; box-shadow: 0 20px 60px rgba(0,0,0,0.28); }
+    .chat { display:flex; flex-direction:column; min-height: 620px; overflow:hidden; }
+    #messages { flex:1; overflow:auto; padding:18px; display:flex; flex-direction:column; gap:14px; }
+    .msg { max-width:86%; padding:12px 14px; border-radius:16px; line-height:1.55; white-space:pre-wrap; word-break:break-word; }
+    .user { align-self:flex-end; background:#3152a3; }
+    .assistant { align-self:flex-start; background:#1a2440; border:1px solid #2a3a61; }
+    .thinking { color:#b9c5e8; border-left:3px solid var(--accent); padding-left:10px; margin-bottom:8px; opacity:0.9; font-size: 13px; }
+    .composer { border-top:1px solid var(--border); padding:14px; display:flex; gap:10px; align-items:flex-end; }
+    textarea { flex:1; min-height:46px; max-height:160px; resize:vertical; border-radius:14px; border:1px solid var(--border); background:#0d1428; color:var(--text); padding:12px; font:inherit; outline:none; }
+    button { border:0; border-radius:12px; background:var(--accent); color:white; padding:12px 16px; font-weight:700; cursor:pointer; }
+    button.secondary { background:#263553; color:#dbe5ff; }
+    button:disabled { opacity:0.55; cursor:not-allowed; }
+    .settings { padding:16px; height:max-content; }
+    .settings h2 { font-size:16px; margin:0 0 14px; }
+    .field { margin: 14px 0; }
+    label { display:flex; justify-content:space-between; color:#dce5ff; font-size:13px; margin-bottom:6px; }
+    input[type="range"] { width:100%; }
+    .note { color:var(--muted); font-size:12px; line-height:1.45; margin-top:14px; }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } .chat { min-height: 560px; } .msg { max-width:96%; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>MiniCPM5-1B OrangePi Demo</h1>
+        <div class="sub">Local Ascend C++ runtime + Hugging Face tokenizer wrapper</div>
+      </div>
+      <div class="badge" id="status">ready · greedy backend</div>
+    </header>
+    <div class="layout">
+      <main class="chat">
+        <div id="messages">
+          <div class="msg assistant">Hello! I'm MiniCPM5-1B. How can I help you today?</div>
+        </div>
+        <div class="composer">
+          <textarea id="input" placeholder="Ask MiniCPM5..." autofocus></textarea>
+          <button id="send">Send</button>
+          <button id="stop" class="secondary" disabled>Stop</button>
+        </div>
+      </main>
+      <aside class="settings">
+        <h2>Settings</h2>
+        <div class="field">
+          <label><span>Thinking mode</span><input id="thinking" type="checkbox" checked /></label>
+        </div>
+        <div class="field">
+          <label><span>Temperature</span><span id="tempVal">0.00</span></label>
+          <input id="temperature" type="range" min="0" max="1" step="0.05" value="0" />
+        </div>
+        <div class="field">
+          <label><span>Top-p</span><span id="topPVal">1.00</span></label>
+          <input id="topP" type="range" min="0" max="1" step="0.01" value="1" />
+        </div>
+        <div class="field">
+          <label><span>Max new tokens</span><span id="maxNewVal">256</span></label>
+          <input id="maxNew" type="range" min="16" max="1024" step="16" value="256" />
+        </div>
+        <button class="secondary" id="clear" style="width:100%">Clear history</button>
+        <div class="note">Temperature and top-p are shown for API compatibility with the Hugging Face Space. The current local C++ backend is greedy-only.</div>
+      </aside>
+    </div>
+  </div>
+<script>
+const $ = (id) => document.getElementById(id);
+const messages = $('messages');
+const input = $('input');
+const send = $('send');
+const stop = $('stop');
+const statusEl = $('status');
+const history = [];
+let aborter = null;
+
+async function refreshHealth() {
+  try {
+    const resp = await fetch('/health', {cache: 'no-store'});
+    const h = await resp.json();
+    if (!h.backend_exists) statusEl.textContent = 'backend missing';
+    else if (h.backend_ready) statusEl.textContent = 'ready · greedy backend';
+    else if (h.backend_alive) statusEl.textContent = 'loading model…';
+    else statusEl.textContent = 'starting backend…';
+  } catch (_) {
+    statusEl.textContent = 'server unavailable';
+  }
+}
+setInterval(refreshHealth, 2000);
+refreshHealth();
+
+for (const [slider, label] of [['temperature','tempVal'], ['topP','topPVal'], ['maxNew','maxNewVal']]) {
+  $(slider).addEventListener('input', () => { $(label).textContent = Number($(slider).value).toFixed(slider === 'maxNew' ? 0 : 2); });
+}
+
+function addMessage(role, text) {
+  const el = document.createElement('div');
+  el.className = `msg ${role}`;
+  el.textContent = text;
+  messages.appendChild(el);
+  messages.scrollTop = messages.scrollHeight;
+  return el;
+}
+
+function splitThinking(text) {
+  const end = text.indexOf('</think>');
+  if (!$('thinking').checked) return { thinking: '', answer: text.replaceAll('<think>', '').replaceAll('</think>', '') };
+  if (text.includes('<think>') && end === -1) return { thinking: text.replace('<think>', '').trim(), answer: '' };
+  if (end !== -1) return { thinking: text.slice(0, end).replace('<think>', '').trim(), answer: text.slice(end + 8).trim() };
+  return { thinking: '', answer: text };
+}
+
+function renderAssistant(el, text) {
+  const {thinking, answer} = splitThinking(text);
+  el.innerHTML = '';
+  if (thinking) {
+    const t = document.createElement('div');
+    t.className = 'thinking';
+    t.textContent = thinking;
+    el.appendChild(t);
+  }
+  const a = document.createElement('div');
+  a.textContent = answer || (thinking ? 'Thinking…' : '');
+  el.appendChild(a);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || aborter) return;
+  input.value = '';
+  addMessage('user', text);
+  const assistantEl = addMessage('assistant', '');
+  aborter = new AbortController();
+  send.disabled = true; stop.disabled = false; statusEl.textContent = 'generating…';
+  let finalText = '';
+  try {
+    const resp = await fetch('/predict', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, signal: aborter.signal,
+      body: JSON.stringify({
+        message: text,
+        history,
+        thinking_mode: $('thinking').checked,
+        temperature: Number($('temperature').value),
+        top_p: Number($('topP').value),
+        max_new_tokens: Number($('maxNew').value),
+      })
+    });
+    if (!resp.ok || !resp.body) throw new Error(await resp.text());
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream:true});
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const data = JSON.parse(line);
+        if (data.error) throw new Error(data.error);
+        if (data.text !== undefined) { finalText = data.text; renderAssistant(assistantEl, finalText); }
+      }
+    }
+    history.push([text, finalText]);
+  } catch (err) {
+    if (err.name !== 'AbortError') renderAssistant(assistantEl, `Error: ${err.message || err}`);
+  } finally {
+    aborter = null; send.disabled = false; stop.disabled = true; statusEl.textContent = 'ready · greedy backend';
+  }
+}
+
+send.addEventListener('click', sendMessage);
+input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+stop.addEventListener('click', async () => { if (aborter) aborter.abort(); await fetch('/cancel', {method:'POST'}); });
+clear.addEventListener('click', () => { history.length = 0; messages.innerHTML = '<div class="msg assistant">Hello! I\'m MiniCPM5-1B. How can I help you today?</div>'; });
+</script>
+</body>
+</html>

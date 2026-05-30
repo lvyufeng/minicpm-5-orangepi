@@ -122,14 +122,12 @@ void copy_row(const Tensor& src, int64_t src_row, Tensor& dst, int64_t dst_row, 
     auto* d = static_cast<uint8_t*>(dst.data()) + static_cast<size_t>(dst_row) * row_bytes;
     check_acl(aclrtMemcpyAsync(d, row_bytes, s, row_bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
               "lm copy_row");
-    check_acl(aclrtSynchronizeStream(stream), "lm copy_row sync");
 }
 
 void copy_tensor(const Tensor& src, Tensor& dst, aclrtStream stream) {
     check_acl(aclrtMemcpyAsync(dst.data(), dst.size_bytes(), src.data(), src.size_bytes(),
                                ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
               "lm copy_tensor");
-    check_acl(aclrtSynchronizeStream(stream), "lm copy_tensor sync");
 }
 
 Tensor load_matmul_weight_transposed(WeightsIndex& index, const LanguageModelConfig& cfg, int layer, const std::string& suffix) {
@@ -486,6 +484,14 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
                        aclrtStream stream) {
     LmHeadScratch scratch;
     return lm_head_greedy_with_scratch(last_hidden_1xH, w, cfg, scratch, stream);
+}
+
+int64_t lm_head_greedy_with_state(const Tensor& last_hidden_1xH,
+                                  const LanguageModelWeights& w,
+                                  const LanguageModelConfig& cfg,
+                                  DecodeState& state,
+                                  aclrtStream stream) {
+    return lm_head_greedy_with_scratch(last_hidden_1xH, w, cfg, state.lm_head_scratch, stream);
 }
 
 int64_t decode_step_greedy(int32_t token_id,

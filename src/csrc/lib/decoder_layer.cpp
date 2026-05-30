@@ -459,7 +459,6 @@ void run_prefill_core(const Tensor& hidden,
                                        ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
                       "v_full -> v_cache");
         }
-        check_acl(aclrtSynchronizeStream(stream), "kv cache write sync");
     }
 
     Tensor& attn_out = scratch.attn_out;

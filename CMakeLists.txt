@@ -70,6 +70,9 @@ if(MINICPM5_ENABLE_ENGINE)
   add_executable(minicpm5_decode src/csrc/tools/minicpm5_decode.cpp)
   target_link_libraries(minicpm5_decode PRIVATE minicpmv_engine)
 
+  add_executable(minicpm5_server src/csrc/tools/minicpm5_server.cpp)
+  target_link_libraries(minicpm5_server PRIVATE minicpmv_engine)
+
   file(GLOB TEST_SRCS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
   file(GLOB BENCH_SRCS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/bench/*.cpp)
 

@@ -94,6 +94,12 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
                        const LanguageModelConfig& cfg,
                        aclrtStream stream);
 
+int64_t lm_head_greedy_with_state(const Tensor& last_hidden_1xH,
+                                  const LanguageModelWeights& w,
+                                  const LanguageModelConfig& cfg,
+                                  DecodeState& state,
+                                  aclrtStream stream);
+
 int64_t decode_step_greedy(int32_t token_id,
                            const LanguageModelWeights& w,
                            const LanguageModelConfig& cfg,

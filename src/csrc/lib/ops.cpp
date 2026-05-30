@@ -72,7 +72,6 @@ void embedding_lookup(const Tensor& weight,
                                    ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
                   "aclrtMemcpyAsync embedding row");
     }
-    check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream embedding");
 }
 
 namespace {
@@ -365,9 +364,11 @@ void run_op(const char* name,
         if (workspace) aclrtFree(workspace);
         throw std::runtime_error(std::string(name) + " failed: " + std::to_string(ret));
     }
-    auto sync_ret = aclrtSynchronizeStream(stream);
-    if (workspace) aclrtFree(workspace);
-    check_acl(sync_ret, "aclrtSynchronizeStream");
+    if (workspace) {
+        auto sync_ret = aclrtSynchronizeStream(stream);
+        aclrtFree(workspace);
+        check_acl(sync_ret, "aclrtSynchronizeStream");
+    }
 }
 
 void check_same_shape(const Tensor& a, const Tensor& b, const char* op) {

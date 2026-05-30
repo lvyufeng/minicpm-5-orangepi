@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+transformers>=4.56
+sentencepiece
+pydantic>=2
