@@ -208,6 +208,106 @@ float h16_to_f32(uint16_t h) {
     return f;
 }
 
+bool tensor_ready(const Tensor& t, const std::vector<int64_t>& shape, DType dtype) {
+    return t.data() != nullptr && t.dtype() == dtype && t.shape() == shape;
+}
+
+void ensure_tensor(Tensor& t, std::vector<int64_t> shape, DType dtype) {
+    if (tensor_ready(t, shape, dtype)) return;
+    t = Tensor(std::move(shape), dtype);
+    t.allocate();
+}
+
+void ensure_lm_head_scratch(LmHeadScratch& s,
+                            int64_t hidden_size,
+                            int64_t chunk_n,
+                            int64_t num_chunks,
+                            bool use_w8a8) {
+    ensure_tensor(s.normed, {1, hidden_size}, DType::Float16);
+    ensure_tensor(s.logits, {1, chunk_n}, DType::Float16);
+    ensure_tensor(s.chunk_best_value, {1}, DType::Float16);
+    ensure_tensor(s.chunk_best_index, {1}, DType::Int32);
+    ensure_tensor(s.chunk_best_values, {num_chunks}, DType::Float16);
+    ensure_tensor(s.chunk_best_indices, {num_chunks}, DType::Int32);
+    if (use_w8a8) {
+        ensure_tensor(s.logits_i32, {1, chunk_n}, DType::Int32);
+        ensure_tensor(s.normed_i8, {1, hidden_size}, DType::Int8);
+        ensure_tensor(s.normed_scale, {1}, DType::Float16);
+    }
+}
+
+int64_t lm_head_greedy_with_scratch(const Tensor& last_hidden_1xH,
+                                    const LanguageModelWeights& w,
+                                    const LanguageModelConfig& cfg,
+                                    LmHeadScratch& scratch,
+                                    aclrtStream stream) {
+    ProfileScope profile("lm_head_greedy", stream);
+    if (last_hidden_1xH.shape() != std::vector<int64_t>{1, cfg.hidden_size}) {
+        throw std::runtime_error("lm_head_greedy hidden must be [1, hidden_size]");
+    }
+    if (w.lm_head_chunks.empty()) {
+        throw std::runtime_error("lm_head_greedy missing pre-built chunks");
+    }
+
+    const int64_t kChunkN = w.lm_head_chunks.front().weight_kn.shape()[1];
+    const int64_t num_chunks = static_cast<int64_t>(w.lm_head_chunks.size());
+    const bool use_w8a8 = w8a8_decode_enabled();
+    ensure_lm_head_scratch(scratch, cfg.hidden_size, kChunkN, num_chunks, use_w8a8);
+
+    Tensor& normed = scratch.normed;
+    rms_norm_with_scratch(last_hidden_1xH, w.final_norm_w, normed,
+                          cfg.rms_epsilon, scratch.norm_scratch, stream);
+
+    Tensor& logits = scratch.logits;
+    Tensor& chunk_best_value = scratch.chunk_best_value;
+    Tensor& chunk_best_index = scratch.chunk_best_index;
+    Tensor& chunk_best_values = scratch.chunk_best_values;
+    Tensor& chunk_best_indices = scratch.chunk_best_indices;
+
+    if (use_w8a8) {
+        w8a8_quantize(normed, scratch.normed_i8, scratch.normed_scale, stream);
+    }
+
+    for (size_t chunk_idx = 0; chunk_idx < w.lm_head_chunks.size(); ++chunk_idx) {
+        const auto& chunk = w.lm_head_chunks[chunk_idx];
+        if (use_w8a8 && chunk.weight_w8.w_int8.data() != nullptr) {
+            matmul_w8a8_i32(scratch.normed_i8, chunk.weight_w8.w_int8, scratch.logits_i32, stream);
+            w8a8_dequant(scratch.logits_i32, scratch.normed_scale, chunk.weight_w8.w_scale, logits, stream);
+        } else {
+            matmul_b_transposed(normed, chunk.weight_kn, logits, stream);
+        }
+        const int64_t valid = std::min<int64_t>(kChunkN, cfg.vocab_size - chunk.start_vocab);
+        logits_top1(logits, valid, chunk_best_value, chunk_best_index, stream);
+        check_acl(aclrtMemcpyAsync(static_cast<uint8_t*>(chunk_best_values.data()) + chunk_idx * dtype_size(DType::Float16),
+                                   dtype_size(DType::Float16),
+                                   chunk_best_value.data(), dtype_size(DType::Float16),
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                  "lm_head collect chunk value");
+        check_acl(aclrtMemcpyAsync(static_cast<uint8_t*>(chunk_best_indices.data()) + chunk_idx * dtype_size(DType::Int32),
+                                   dtype_size(DType::Int32),
+                                   chunk_best_index.data(), dtype_size(DType::Int32),
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                  "lm_head collect chunk index");
+    }
+    check_acl(aclrtSynchronizeStream(stream), "lm_head chunk top1 sync");
+
+    std::vector<uint16_t> chunk_best_value_host(static_cast<size_t>(num_chunks));
+    std::vector<int32_t> chunk_best_index_host(static_cast<size_t>(num_chunks));
+    chunk_best_values.copy_to_host(chunk_best_value_host.data(), chunk_best_value_host.size() * sizeof(uint16_t));
+    chunk_best_indices.copy_to_host(chunk_best_index_host.data(), chunk_best_index_host.size() * sizeof(int32_t));
+
+    int64_t best_token = 0;
+    float best_logit = -std::numeric_limits<float>::infinity();
+    for (size_t chunk_idx = 0; chunk_idx < w.lm_head_chunks.size(); ++chunk_idx) {
+        const float v = h16_to_f32(chunk_best_value_host[chunk_idx]);
+        if (v > best_logit) {
+            best_logit = v;
+            best_token = w.lm_head_chunks[chunk_idx].start_vocab + chunk_best_index_host[chunk_idx];
+        }
+    }
+    return best_token;
+}
+
 }  // namespace
 
 LanguageModelConfig default_minicpm5_1b_lm_config() {
@@ -384,76 +484,8 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
                        const LanguageModelWeights& w,
                        const LanguageModelConfig& cfg,
                        aclrtStream stream) {
-    ProfileScope profile("lm_head_greedy", stream);
-    if (last_hidden_1xH.shape() != std::vector<int64_t>{1, cfg.hidden_size}) {
-        throw std::runtime_error("lm_head_greedy hidden must be [1, hidden_size]");
-    }
-    if (w.lm_head_chunks.empty()) {
-        throw std::runtime_error("lm_head_greedy missing pre-built chunks");
-    }
-    Tensor normed({1, cfg.hidden_size}, DType::Float16); normed.allocate();
-    rms_norm(last_hidden_1xH, w.final_norm_w, normed, cfg.rms_epsilon, stream);
-
-    const int64_t kChunkN = w.lm_head_chunks.front().weight_kn.shape()[1];
-    Tensor logits({1, kChunkN}, DType::Float16); logits.allocate();
-    Tensor chunk_best_value({1}, DType::Float16); chunk_best_value.allocate();
-    Tensor chunk_best_index({1}, DType::Int32); chunk_best_index.allocate();
-    const int64_t num_chunks = static_cast<int64_t>(w.lm_head_chunks.size());
-    Tensor chunk_best_values({num_chunks}, DType::Float16); chunk_best_values.allocate();
-    Tensor chunk_best_indices({num_chunks}, DType::Int32); chunk_best_indices.allocate();
-
-    const bool use_w8a8 = w8a8_decode_enabled();
-    Tensor logits_i32;
-    Tensor normed_i8;
-    Tensor normed_scale;
-    if (use_w8a8) {
-        logits_i32 = Tensor({1, kChunkN}, DType::Int32);
-        logits_i32.allocate();
-        normed_i8 = Tensor({1, cfg.hidden_size}, DType::Int8);
-        normed_i8.allocate();
-        normed_scale = Tensor({1}, DType::Float16);
-        normed_scale.allocate();
-        w8a8_quantize(normed, normed_i8, normed_scale, stream);
-    }
-
-    for (size_t chunk_idx = 0; chunk_idx < w.lm_head_chunks.size(); ++chunk_idx) {
-        const auto& chunk = w.lm_head_chunks[chunk_idx];
-        if (use_w8a8 && chunk.weight_w8.w_int8.data() != nullptr) {
-            matmul_w8a8_i32(normed_i8, chunk.weight_w8.w_int8, logits_i32, stream);
-            w8a8_dequant(logits_i32, normed_scale, chunk.weight_w8.w_scale, logits, stream);
-        } else {
-            matmul_b_transposed(normed, chunk.weight_kn, logits, stream);
-        }
-        const int64_t valid = std::min<int64_t>(kChunkN, cfg.vocab_size - chunk.start_vocab);
-        logits_top1(logits, valid, chunk_best_value, chunk_best_index, stream);
-        check_acl(aclrtMemcpyAsync(static_cast<uint8_t*>(chunk_best_values.data()) + chunk_idx * dtype_size(DType::Float16),
-                                   dtype_size(DType::Float16),
-                                   chunk_best_value.data(), dtype_size(DType::Float16),
-                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
-                  "lm_head collect chunk value");
-        check_acl(aclrtMemcpyAsync(static_cast<uint8_t*>(chunk_best_indices.data()) + chunk_idx * dtype_size(DType::Int32),
-                                   dtype_size(DType::Int32),
-                                   chunk_best_index.data(), dtype_size(DType::Int32),
-                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
-                  "lm_head collect chunk index");
-    }
-    check_acl(aclrtSynchronizeStream(stream), "lm_head chunk top1 sync");
-
-    std::vector<uint16_t> chunk_best_value_host(static_cast<size_t>(num_chunks));
-    std::vector<int32_t> chunk_best_index_host(static_cast<size_t>(num_chunks));
-    chunk_best_values.copy_to_host(chunk_best_value_host.data(), chunk_best_value_host.size() * sizeof(uint16_t));
-    chunk_best_indices.copy_to_host(chunk_best_index_host.data(), chunk_best_index_host.size() * sizeof(int32_t));
-
-    int64_t best_token = 0;
-    float best_logit = -std::numeric_limits<float>::infinity();
-    for (size_t chunk_idx = 0; chunk_idx < w.lm_head_chunks.size(); ++chunk_idx) {
-        const float v = h16_to_f32(chunk_best_value_host[chunk_idx]);
-        if (v > best_logit) {
-            best_logit = v;
-            best_token = w.lm_head_chunks[chunk_idx].start_vocab + chunk_best_index_host[chunk_idx];
-        }
-    }
-    return best_token;
+    LmHeadScratch scratch;
+    return lm_head_greedy_with_scratch(last_hidden_1xH, w, cfg, scratch, stream);
 }
 
 int64_t decode_step_greedy(int32_t token_id,
@@ -503,7 +535,7 @@ int64_t decode_step_greedy(int32_t token_id,
         }
     }
     ++state.seq_len;
-    return lm_head_greedy(*in, w, cfg, stream);
+    return lm_head_greedy_with_scratch(*in, w, cfg, state.lm_head_scratch, stream);
 }
 
 bool is_eos(int64_t token_id, const std::vector<int64_t>& eos_token_ids) {

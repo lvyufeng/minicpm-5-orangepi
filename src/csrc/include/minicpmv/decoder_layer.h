@@ -85,24 +85,50 @@ struct PrefillLayerScratch {
 
 struct AttentionLayerScratch {
     Tensor normed;
+    RmsNormScratch input_norm_scratch;
+    RmsNormScratch mlp_norm_scratch;
     Tensor q_full;
     Tensor k_full;
     Tensor v_full;
     Tensor normed_i8;
     Tensor normed_scale;
+    Tensor q_acc_i32;
+    Tensor k_acc_i32;
+    Tensor v_acc_i32;
     Tensor q_heads;
     Tensor k_heads;
     Tensor q_rope;
     Tensor attn_out;
+    Tensor attn_out_i8;
+    Tensor attn_out_scale;
+    Tensor o_acc_i32;
     Tensor attn_proj;
     Tensor after_attn;
     Tensor mlp_in;
     Tensor mlp_i8;
     Tensor mlp_scale;
+    Tensor gate_acc_i32;
+    Tensor up_acc_i32;
     Tensor gate;
     Tensor up;
     Tensor gated;
+    Tensor gated_i8;
+    Tensor gated_scale;
+    Tensor down_acc_i32;
     Tensor mlp_out;
+};
+
+struct LmHeadScratch {
+    Tensor normed;
+    RmsNormScratch norm_scratch;
+    Tensor logits;
+    Tensor chunk_best_value;
+    Tensor chunk_best_index;
+    Tensor chunk_best_values;
+    Tensor chunk_best_indices;
+    Tensor logits_i32;
+    Tensor normed_i8;
+    Tensor normed_scale;
 };
 
 struct AttentionLayerCache {
@@ -116,6 +142,7 @@ struct DecodeState {
     int64_t seq_len{0};
     Tensor hidden_a;
     Tensor hidden_b;
+    LmHeadScratch lm_head_scratch;
     std::vector<AttentionLayerCache> layers;
 };
 

@@ -198,11 +198,29 @@ bool w8a8_weight_ready(const W8A8QuantizedWeight* w8_weight) {
 void matmul_decode_w8a8_prequant(const Tensor& x_int8,
                                  const Tensor& x_scale,
                                  const W8A8QuantizedWeight& w8_weight,
+                                 Tensor& acc_i32,
                                  Tensor& out,
                                  aclrtStream stream) {
+    if (x_int8.shape() != std::vector<int64_t>{1, w8_weight.K} || x_int8.dtype() != DType::Int8) {
+        throw std::runtime_error("W8A8 input shape mismatch");
+    }
+    if (acc_i32.shape() != std::vector<int64_t>{1, w8_weight.N} || acc_i32.dtype() != DType::Int32) {
+        throw std::runtime_error("W8A8 accumulator shape mismatch");
+    }
+    if (out.shape() != std::vector<int64_t>{1, w8_weight.N} || out.dtype() != DType::Float16) {
+        throw std::runtime_error("W8A8 output shape mismatch");
+    }
+    matmul_w8a8_i32(x_int8, w8_weight.w_int8, acc_i32, stream);
+    w8a8_dequant(acc_i32, x_scale, w8_weight.w_scale, out, stream);
+}
+
+void matmul_decode_w8a8_prequant_allocating(const Tensor& x_int8,
+                                            const Tensor& x_scale,
+                                            const W8A8QuantizedWeight& w8_weight,
+                                            Tensor& out,
+                                            aclrtStream stream) {
     Tensor acc({1, w8_weight.N}, DType::Int32); acc.allocate();
-    matmul_w8a8_i32(x_int8, w8_weight.w_int8, acc, stream);
-    w8a8_dequant(acc, x_scale, w8_weight.w_scale, out, stream);
+    matmul_decode_w8a8_prequant(x_int8, x_scale, w8_weight, acc, out, stream);
 }
 
 void matmul_decode_dispatch(const Tensor& x,
@@ -215,7 +233,7 @@ void matmul_decode_dispatch(const Tensor& x,
         Tensor x_int8(x.shape(), DType::Int8); x_int8.allocate();
         Tensor x_scale({1}, DType::Float16); x_scale.allocate();
         w8a8_quantize(x, x_int8, x_scale, stream);
-        matmul_decode_w8a8_prequant(x_int8, x_scale, *w8_weight, out, stream);
+        matmul_decode_w8a8_prequant_allocating(x_int8, x_scale, *w8_weight, out, stream);
         return;
     }
     if (quant_weight != nullptr && x.shape().size() == 2 && x.shape()[0] == 1) {
@@ -611,9 +629,16 @@ void ensure_step_scratch(AttentionLayerScratch& s,
         s.q_full.shape() == std::vector<int64_t>{1, q_dim} &&
         s.k_full.shape() == std::vector<int64_t>{1, kv_dim} &&
         s.v_full.shape() == std::vector<int64_t>{1, kv_dim} &&
+        s.q_acc_i32.shape() == std::vector<int64_t>{1, q_dim} &&
+        s.k_acc_i32.shape() == std::vector<int64_t>{1, kv_dim} &&
+        s.v_acc_i32.shape() == std::vector<int64_t>{1, kv_dim} &&
         s.q_heads.shape() == std::vector<int64_t>{num_q_heads, head_dim} &&
         s.k_heads.shape() == std::vector<int64_t>{num_kv_heads, head_dim} &&
-        s.gate.shape() == std::vector<int64_t>{1, intermediate}) {
+        s.o_acc_i32.shape() == std::vector<int64_t>{1, hidden_size} &&
+        s.gate.shape() == std::vector<int64_t>{1, intermediate} &&
+        s.gate_acc_i32.shape() == std::vector<int64_t>{1, intermediate} &&
+        s.up_acc_i32.shape() == std::vector<int64_t>{1, intermediate} &&
+        s.down_acc_i32.shape() == std::vector<int64_t>{1, hidden_size}) {
         return;
     }
     auto make = [](std::vector<int64_t> shape) {
@@ -621,26 +646,45 @@ void ensure_step_scratch(AttentionLayerScratch& s,
         t.allocate();
         return t;
     };
+    auto make_i8 = [](std::vector<int64_t> shape) {
+        Tensor t(std::move(shape), DType::Int8);
+        t.allocate();
+        return t;
+    };
+    auto make_i32 = [](std::vector<int64_t> shape) {
+        Tensor t(std::move(shape), DType::Int32);
+        t.allocate();
+        return t;
+    };
     s.normed = make({1, hidden_size});
     s.q_full = make({1, q_dim});
     s.k_full = make({1, kv_dim});
     s.v_full = make({1, kv_dim});
-    s.normed_i8 = Tensor({1, hidden_size}, DType::Int8);
-    s.normed_i8.allocate();
+    s.normed_i8 = make_i8({1, hidden_size});
     s.normed_scale = make({1});
+    s.q_acc_i32 = make_i32({1, q_dim});
+    s.k_acc_i32 = make_i32({1, kv_dim});
+    s.v_acc_i32 = make_i32({1, kv_dim});
     s.q_heads = make({num_q_heads, head_dim});
     s.k_heads = make({num_kv_heads, head_dim});
     s.q_rope = make({num_q_heads, head_dim});
     s.attn_out = make({1, q_dim});
+    s.attn_out_i8 = make_i8({1, q_dim});
+    s.attn_out_scale = make({1});
+    s.o_acc_i32 = make_i32({1, hidden_size});
     s.attn_proj = make({1, hidden_size});
     s.after_attn = make({1, hidden_size});
     s.mlp_in = make({1, hidden_size});
-    s.mlp_i8 = Tensor({1, hidden_size}, DType::Int8);
-    s.mlp_i8.allocate();
+    s.mlp_i8 = make_i8({1, hidden_size});
     s.mlp_scale = make({1});
+    s.gate_acc_i32 = make_i32({1, intermediate});
+    s.up_acc_i32 = make_i32({1, intermediate});
     s.gate = make({1, intermediate});
     s.up = make({1, intermediate});
     s.gated = make({1, intermediate});
+    s.gated_i8 = make_i8({1, intermediate});
+    s.gated_scale = make({1});
+    s.down_acc_i32 = make_i32({1, hidden_size});
     s.mlp_out = make({1, hidden_size});
 }
 
@@ -706,7 +750,8 @@ void attention_decoder_layer_step(const Tensor& hidden,
     Tensor& normed = s.normed;
     {
         ProfileScope p("decode.input_norm", stream);
-        rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
+        rms_norm_with_scratch(hidden, *weights.input_norm_weight, normed,
+                              config.rms_epsilon, s.input_norm_scratch, stream);
     }
 
     Tensor& q_full = s.q_full;
@@ -721,17 +766,17 @@ void attention_decoder_layer_step(const Tensor& hidden,
             Tensor& normed_scale = s.normed_scale;
             w8a8_quantize(normed, normed_i8, normed_scale, stream);
             if (w8a8_weight_ready(weights.q_proj_w8)) {
-                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.q_proj_w8, q_full, stream);
+                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.q_proj_w8, s.q_acc_i32, q_full, stream);
             } else {
                 matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, nullptr, q_full, stream);
             }
             if (w8a8_weight_ready(weights.k_proj_w8)) {
-                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.k_proj_w8, k_full, stream);
+                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.k_proj_w8, s.k_acc_i32, k_full, stream);
             } else {
                 matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, nullptr, k_full, stream);
             }
             if (w8a8_weight_ready(weights.v_proj_w8)) {
-                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.v_proj_w8, v_full, stream);
+                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.v_proj_w8, s.v_acc_i32, v_full, stream);
             } else {
                 matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, nullptr, v_full, stream);
             }
@@ -772,14 +817,20 @@ void attention_decoder_layer_step(const Tensor& hidden,
     Tensor& after_attn = s.after_attn;
     {
         ProfileScope p("decode.o_proj", stream);
-        matmul_decode_dispatch(attn_out, weights.o_proj_weight, weights.o_proj_q, weights.o_proj_w8, attn_proj, stream);
+        if (w8a8_weight_ready(weights.o_proj_w8)) {
+            w8a8_quantize(attn_out, s.attn_out_i8, s.attn_out_scale, stream);
+            matmul_decode_w8a8_prequant(s.attn_out_i8, s.attn_out_scale, *weights.o_proj_w8, s.o_acc_i32, attn_proj, stream);
+        } else {
+            matmul_decode_dispatch(attn_out, weights.o_proj_weight, weights.o_proj_q, nullptr, attn_proj, stream);
+        }
         add(hidden, attn_proj, after_attn, stream);
     }
 
     Tensor& mlp_in = s.mlp_in;
     {
         ProfileScope p("decode.mlp_norm", stream);
-        rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
+        rms_norm_with_scratch(after_attn, *weights.post_attention_norm_weight, mlp_in,
+                              config.rms_epsilon, s.mlp_norm_scratch, stream);
     }
 
     Tensor& gate = s.gate;
@@ -794,12 +845,12 @@ void attention_decoder_layer_step(const Tensor& hidden,
             Tensor& mlp_scale = s.mlp_scale;
             w8a8_quantize(mlp_in, mlp_i8, mlp_scale, stream);
             if (w8a8_weight_ready(weights.gate_proj_w8)) {
-                matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.gate_proj_w8, gate, stream);
+                matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.gate_proj_w8, s.gate_acc_i32, gate, stream);
             } else {
                 matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, nullptr, gate, stream);
             }
             if (w8a8_weight_ready(weights.up_proj_w8)) {
-                matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.up_proj_w8, up, stream);
+                matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.up_proj_w8, s.up_acc_i32, up, stream);
             } else {
                 matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
             }
@@ -808,7 +859,12 @@ void attention_decoder_layer_step(const Tensor& hidden,
             matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
         }
         silu_mul(gate, up, gated, stream);
-        matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, weights.down_proj_w8, mlp_out, stream);
+        if (w8a8_weight_ready(weights.down_proj_w8)) {
+            w8a8_quantize(gated, s.gated_i8, s.gated_scale, stream);
+            matmul_decode_w8a8_prequant(s.gated_i8, s.gated_scale, *weights.down_proj_w8, s.down_acc_i32, mlp_out, stream);
+        } else {
+            matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, nullptr, mlp_out, stream);
+        }
         add(after_attn, mlp_out, out, stream);
     }
 }

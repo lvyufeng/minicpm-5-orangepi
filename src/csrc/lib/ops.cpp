@@ -26,6 +26,7 @@
 #include "aclnn_rope_prefill_custom.h"
 #include "aclnn_prefill_attention_custom.h"
 #include "aclnn_silu_mul_custom.h"
+#include "aclnn_rms_norm_custom.h"
 #include "aclnn_matmul_vec_custom.h"
 #include "aclnn_matmul_cube_custom.h"
 
@@ -526,8 +527,35 @@ void softmax_last_dim(const Tensor& self, Tensor& out, aclrtStream stream) {
     run_op("aclnnSoftmax", ws_size, executor, stream, aclnnSoftmax);
 }
 
-void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
-              double epsilon, aclrtStream stream) {
+namespace {
+
+bool tensor_ready(const Tensor& t, const std::vector<int64_t>& shape, DType dtype) {
+    return t.data() != nullptr && t.dtype() == dtype && t.shape() == shape;
+}
+
+void ensure_tensor(Tensor& t, const std::vector<int64_t>& shape, DType dtype) {
+    if (tensor_ready(t, shape, dtype)) return;
+    t = Tensor(shape, dtype);
+    t.allocate();
+}
+
+void ensure_rms_norm_scratch(RmsNormScratch& s,
+                             const std::vector<int64_t>& x_shape,
+                             const std::vector<int64_t>& gamma_shape,
+                             const std::vector<int64_t>& reduce_shape) {
+    ensure_tensor(s.x_f32, x_shape, DType::Float32);
+    ensure_tensor(s.gamma_f32, gamma_shape, DType::Float32);
+    ensure_tensor(s.x_sq, x_shape, DType::Float32);
+    ensure_tensor(s.mean_x_sq, reduce_shape, DType::Float32);
+    ensure_tensor(s.rstd, reduce_shape, DType::Float32);
+    ensure_tensor(s.scaled, x_shape, DType::Float32);
+    ensure_tensor(s.normed_f32, x_shape, DType::Float32);
+}
+
+}  // namespace
+
+void rms_norm_with_scratch(const Tensor& x, const Tensor& gamma, Tensor& out,
+                           double epsilon, RmsNormScratch& scratch, aclrtStream stream) {
     if (x.shape() != out.shape()) {
         throw std::runtime_error("rms_norm x/out shape mismatch");
     }
@@ -542,20 +570,44 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         throw std::runtime_error("rms_norm dtype mismatch (x/gamma/out must match)");
     }
 
+    if (x.dtype() == DType::Float16 && hidden > 0 && hidden <= 2048) {
+        int64_t rows = 1;
+        for (size_t i = 0; i + 1 < x.shape().size(); ++i) {
+            rows *= x.shape()[i];
+        }
+        if (rows > 0 && rows <= 1024) {
+            AclTensorHandle hx, hg, ho;
+            make_acl_tensor(x, hx);
+            make_acl_tensor(gamma, hg);
+            make_acl_tensor(out, ho);
+            uint64_t ws_size = 0;
+            aclOpExecutor* executor = nullptr;
+            auto ret = aclnnRmsNormCustomGetWorkspaceSize(
+                hx.tensor, hg.tensor, static_cast<float>(epsilon), ho.tensor,
+                &ws_size, &executor);
+            if (ret != 0) {
+                throw std::runtime_error("aclnnRmsNormCustomGetWorkspaceSize failed: " + std::to_string(ret));
+            }
+            run_op("aclnnRmsNormCustom", ws_size, executor, stream, aclnnRmsNormCustom);
+            return;
+        }
+    }
+
     // Build [..., 1] reduce shape
     std::vector<int64_t> reduce_shape = x.shape();
     reduce_shape.back() = 1;
+    ensure_rms_norm_scratch(scratch, x.shape(), gamma.shape(), reduce_shape);
 
-    Tensor x_f32(x.shape(), DType::Float32); x_f32.allocate();
-    Tensor gamma_f32(gamma.shape(), DType::Float32); gamma_f32.allocate();
+    Tensor& x_f32 = scratch.x_f32;
+    Tensor& gamma_f32 = scratch.gamma_f32;
+    Tensor& x_sq = scratch.x_sq;
+    Tensor& mean_x_sq = scratch.mean_x_sq;
+    Tensor& rstd = scratch.rstd;
+    Tensor& scaled = scratch.scaled;
+    Tensor& normed_f32 = scratch.normed_f32;
+
     cast(x, x_f32, stream);
     cast(gamma, gamma_f32, stream);
-
-    Tensor x_sq(x.shape(), DType::Float32); x_sq.allocate();
-    Tensor mean_x_sq(reduce_shape, DType::Float32); mean_x_sq.allocate();
-    Tensor rstd(reduce_shape, DType::Float32); rstd.allocate();
-    Tensor scaled(x.shape(), DType::Float32); scaled.allocate();
-    Tensor normed_f32(x.shape(), DType::Float32); normed_f32.allocate();
 
     // 1) x_sq = x * x
     {
@@ -668,6 +720,12 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
         run_op("rms_norm Mul(*,gamma)", ws_size, executor, stream, aclnnMul);
     }
     cast(normed_f32, out, stream);
+}
+
+void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
+              double epsilon, aclrtStream stream) {
+    RmsNormScratch scratch;
+    rms_norm_with_scratch(x, gamma, out, epsilon, scratch, stream);
 }
 
 void cast(const Tensor& self, Tensor& out, aclrtStream stream) {

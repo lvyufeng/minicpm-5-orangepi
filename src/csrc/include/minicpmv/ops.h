@@ -43,8 +43,21 @@ void sigmoid(const Tensor& self, Tensor& out, aclrtStream stream);
 
 void softmax_last_dim(const Tensor& self, Tensor& out, aclrtStream stream);
 
+struct RmsNormScratch {
+    Tensor x_f32;
+    Tensor gamma_f32;
+    Tensor x_sq;
+    Tensor mean_x_sq;
+    Tensor rstd;
+    Tensor scaled;
+    Tensor normed_f32;
+};
+
 void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
               double epsilon, aclrtStream stream);
+
+void rms_norm_with_scratch(const Tensor& x, const Tensor& gamma, Tensor& out,
+                           double epsilon, RmsNormScratch& scratch, aclrtStream stream);
 
 void cast(const Tensor& self, Tensor& out, aclrtStream stream);
 
