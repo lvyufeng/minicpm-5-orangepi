@@ -23,6 +23,8 @@
 #include "aclnn_w8a8_dequant_custom.h"
 #include "aclnn_attention_step_custom.h"
 #include "aclnn_rope_cache_write_custom.h"
+#include "aclnn_rope_prefill_custom.h"
+#include "aclnn_prefill_attention_custom.h"
 #include "aclnn_silu_mul_custom.h"
 #include "aclnn_matmul_vec_custom.h"
 #include "aclnn_matmul_cube_custom.h"
@@ -700,15 +702,39 @@ void d2d_row_copy(const void* src, size_t src_row_stride_bytes,
     }
 }
 
+void ensure_rope_scratch(RopeScratch& s, int64_t N, int64_t HalfRot) {
+    const std::vector<int64_t> shape{N, HalfRot};
+    if (s.x1.shape() == shape && s.x2.shape() == shape &&
+        s.cos_e.shape() == shape && s.sin_e.shape() == shape &&
+        s.a.shape() == shape && s.b.shape() == shape &&
+        s.y1.shape() == shape && s.y2.shape() == shape) {
+        return;
+    }
+    auto make = [](const std::vector<int64_t>& tensor_shape) {
+        Tensor t(tensor_shape, DType::Float16);
+        t.allocate();
+        return t;
+    };
+    s.x1 = make(shape);
+    s.x2 = make(shape);
+    s.cos_e = make(shape);
+    s.sin_e = make(shape);
+    s.a = make(shape);
+    s.b = make(shape);
+    s.y1 = make(shape);
+    s.y2 = make(shape);
+}
+
 }  // namespace
 
-void apply_rope_partial(const Tensor& x,
-                        const Tensor& cos_table,
-                        const Tensor& sin_table,
-                        const std::vector<int32_t>& row_to_t,
-                        int64_t rot,
-                        Tensor& out,
-                        aclrtStream stream) {
+void apply_rope_partial_with_scratch(const Tensor& x,
+                                     const Tensor& cos_table,
+                                     const Tensor& sin_table,
+                                     const std::vector<int32_t>& row_to_t,
+                                     int64_t rot,
+                                     RopeScratch& scratch,
+                                     Tensor& out,
+                                     aclrtStream stream) {
     if (x.dtype() != DType::Float16 || cos_table.dtype() != DType::Float16 ||
         sin_table.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
         throw std::runtime_error("apply_rope_partial requires fp16 tensors");
@@ -743,20 +769,21 @@ void apply_rope_partial(const Tensor& x,
         }
     }
 
+    ensure_rope_scratch(scratch, N, HalfRot);
+
     const size_t fp16_size = sizeof(uint16_t);
     const size_t row_bytes_x = static_cast<size_t>(D) * fp16_size;
     const size_t half_bytes = static_cast<size_t>(HalfRot) * fp16_size;
     const size_t tail_bytes = static_cast<size_t>(D - rot) * fp16_size;
 
-    // Allocate slice tensors [N, HalfRot]
-    Tensor x1({N, HalfRot}, DType::Float16); x1.allocate();
-    Tensor x2({N, HalfRot}, DType::Float16); x2.allocate();
-    Tensor cos_e({N, HalfRot}, DType::Float16); cos_e.allocate();
-    Tensor sin_e({N, HalfRot}, DType::Float16); sin_e.allocate();
-    Tensor a({N, HalfRot}, DType::Float16); a.allocate();
-    Tensor b({N, HalfRot}, DType::Float16); b.allocate();
-    Tensor y1({N, HalfRot}, DType::Float16); y1.allocate();
-    Tensor y2({N, HalfRot}, DType::Float16); y2.allocate();
+    Tensor& x1 = scratch.x1;
+    Tensor& x2 = scratch.x2;
+    Tensor& cos_e = scratch.cos_e;
+    Tensor& sin_e = scratch.sin_e;
+    Tensor& a = scratch.a;
+    Tensor& b = scratch.b;
+    Tensor& y1 = scratch.y1;
+    Tensor& y2 = scratch.y2;
 
     auto* x_base = static_cast<const uint8_t*>(x.data());
     auto* out_base = static_cast<uint8_t*>(out.data());
@@ -834,6 +861,112 @@ void apply_rope_partial(const Tensor& x,
                       "rope scatter tail");
         }
     }
+}
+
+void apply_rope_partial(const Tensor& x,
+                        const Tensor& cos_table,
+                        const Tensor& sin_table,
+                        const std::vector<int32_t>& row_to_t,
+                        int64_t rot,
+                        Tensor& out,
+                        aclrtStream stream) {
+    RopeScratch scratch;
+    apply_rope_partial_with_scratch(x, cos_table, sin_table, row_to_t, rot, scratch, out, stream);
+}
+
+void apply_rope_prefill(const Tensor& x,
+                        const Tensor& cos_table,
+                        const Tensor& sin_table,
+                        int64_t heads,
+                        int64_t rotary_dim,
+                        Tensor& out,
+                        aclrtStream stream) {
+    if (x.dtype() != DType::Float16 || cos_table.dtype() != DType::Float16 ||
+        sin_table.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("apply_rope_prefill requires fp16 tensors");
+    }
+    if (x.shape().size() != 2 || out.shape() != x.shape()) {
+        throw std::runtime_error("apply_rope_prefill expects x/out [N, head_dim] same shape");
+    }
+    if (cos_table.shape().size() != 2 || sin_table.shape() != cos_table.shape()) {
+        throw std::runtime_error("apply_rope_prefill cos/sin must be [T, rot/2]");
+    }
+    const int64_t N = x.shape()[0];
+    const int64_t headDim = x.shape()[1];
+    if (heads <= 0 || N % heads != 0) {
+        throw std::runtime_error("apply_rope_prefill N must be a multiple of heads");
+    }
+    if (rotary_dim <= 0 || rotary_dim > headDim || rotary_dim % 2 != 0) {
+        throw std::runtime_error("apply_rope_prefill rot must be even and <= head_dim");
+    }
+    if (cos_table.shape()[1] != rotary_dim / 2) {
+        throw std::runtime_error("apply_rope_prefill cos/sin last dim must be rot/2");
+    }
+
+    AclTensorHandle hx, hcos, hsin, ho;
+    make_acl_tensor(x, hx);
+    make_acl_tensor(cos_table, hcos);
+    make_acl_tensor(sin_table, hsin);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnRopePrefillCustomGetWorkspaceSize(hx.tensor, hcos.tensor, hsin.tensor,
+                                                      heads, rotary_dim, ho.tensor,
+                                                      &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnRopePrefillCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnRopePrefillCustom", ws_size, executor, stream, aclnnRopePrefillCustom);
+}
+
+void prefill_attention_custom(const Tensor& q_rope,
+                              const Tensor& k_rope,
+                              const Tensor& v_full,
+                              int64_t seq_len,
+                              int64_t num_q_heads,
+                              int64_t num_kv_heads,
+                              int64_t head_dim,
+                              float scale,
+                              Tensor& out,
+                              aclrtStream stream) {
+    if (q_rope.dtype() != DType::Float16 || k_rope.dtype() != DType::Float16 ||
+        v_full.dtype() != DType::Float16 || out.dtype() != DType::Float16) {
+        throw std::runtime_error("prefill_attention_custom requires fp16 tensors");
+    }
+    if (seq_len <= 0 || num_q_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||
+        num_q_heads % num_kv_heads != 0) {
+        throw std::runtime_error("prefill_attention_custom invalid dims");
+    }
+    if (q_rope.shape() != std::vector<int64_t>{seq_len * num_q_heads, head_dim}) {
+        throw std::runtime_error("prefill_attention_custom q_rope shape mismatch");
+    }
+    if (k_rope.shape() != std::vector<int64_t>{seq_len * num_kv_heads, head_dim}) {
+        throw std::runtime_error("prefill_attention_custom k_rope shape mismatch");
+    }
+    if (v_full.shape() != std::vector<int64_t>{seq_len, num_kv_heads * head_dim}) {
+        throw std::runtime_error("prefill_attention_custom v_full shape mismatch");
+    }
+    if (out.shape() != std::vector<int64_t>{seq_len, num_q_heads * head_dim}) {
+        throw std::runtime_error("prefill_attention_custom out shape mismatch");
+    }
+
+    AclTensorHandle hq, hk, hv, ho;
+    make_acl_tensor(q_rope, hq);
+    make_acl_tensor(k_rope, hk);
+    make_acl_tensor(v_full, hv);
+    make_acl_tensor(out, ho);
+
+    uint64_t ws_size = 0;
+    aclOpExecutor* executor = nullptr;
+    auto ret = aclnnPrefillAttentionCustomGetWorkspaceSize(
+        hq.tensor, hk.tensor, hv.tensor,
+        seq_len, num_q_heads, num_kv_heads, head_dim, static_cast<double>(scale),
+        ho.tensor, &ws_size, &executor);
+    if (ret != 0) {
+        throw std::runtime_error("aclnnPrefillAttentionCustomGetWorkspaceSize failed: " + std::to_string(ret));
+    }
+    run_op("aclnnPrefillAttentionCustom", ws_size, executor, stream, aclnnPrefillAttentionCustom);
 }
 
 void logits_top1(const Tensor& logits,

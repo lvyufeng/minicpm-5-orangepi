@@ -48,6 +48,17 @@ void rms_norm(const Tensor& x, const Tensor& gamma, Tensor& out,
 
 void cast(const Tensor& self, Tensor& out, aclrtStream stream);
 
+struct RopeScratch {
+    Tensor x1;
+    Tensor x2;
+    Tensor cos_e;
+    Tensor sin_e;
+    Tensor a;
+    Tensor b;
+    Tensor y1;
+    Tensor y2;
+};
+
 void apply_rope_partial(const Tensor& x,
                         const Tensor& cos_table,
                         const Tensor& sin_table,
@@ -55,6 +66,41 @@ void apply_rope_partial(const Tensor& x,
                         int64_t rot,
                         Tensor& out,
                         aclrtStream stream);
+
+void apply_rope_partial_with_scratch(const Tensor& x,
+                                     const Tensor& cos_table,
+                                     const Tensor& sin_table,
+                                     const std::vector<int32_t>& row_to_t,
+                                     int64_t rot,
+                                     RopeScratch& scratch,
+                                     Tensor& out,
+                                     aclrtStream stream);
+
+// Prefill-only fused RoPE custom op. x is [N, head_dim] laid out token-major as
+// row = t*heads + h, so the token index is t = row / heads (no index tensor needed).
+// Applies the same partial RoPE as apply_rope_partial in a single kernel launch.
+void apply_rope_prefill(const Tensor& x,
+                        const Tensor& cos_table,
+                        const Tensor& sin_table,
+                        int64_t heads,
+                        int64_t rotary_dim,
+                        Tensor& out,
+                        aclrtStream stream);
+
+// Prefill causal self-attention custom op. Replaces the per-head host loop.
+// q_rope: [T*num_q_heads, head_dim], k_rope: [T*num_kv_heads, head_dim],
+// v_full: [T, kv_dim]. Output: [T, q_dim]. Causal via loop bound (tk<=tq).
+// Max T supported: 256; caller must fall back to host path for longer sequences.
+void prefill_attention_custom(const Tensor& q_rope,
+                              const Tensor& k_rope,
+                              const Tensor& v_full,
+                              int64_t seq_len,
+                              int64_t num_q_heads,
+                              int64_t num_kv_heads,
+                              int64_t head_dim,
+                              float scale,
+                              Tensor& out,
+                              aclrtStream stream);
 
 void logits_top1(const Tensor& logits,
                  int64_t valid,

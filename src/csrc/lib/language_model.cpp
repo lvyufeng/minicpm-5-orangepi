@@ -360,10 +360,17 @@ Tensor prefill_from_embeddings(const Tensor& prompt_hidden,
     for (int64_t t = 0; t < T; ++t) row_to_t[static_cast<size_t>(t)] = static_cast<int32_t>(t);
 
     const AttentionDecoderLayerConfig acfg = attention_config(cfg);
+    PrefillAttentionShared prefill_shared;
+    build_prefill_attention_shared(row_to_t, acfg, prefill_shared);
+    PrefillLayerScratch prefill_scratch;
     for (int64_t layer = 0; layer < cfg.num_layers; ++layer) {
         const auto ww = attention_weights(w.layers[static_cast<size_t>(layer)]);
-        attention_decoder_layer_with_cache(*in, ww, cos_table, sin_table,
-                                           row_to_t, acfg, state.layers[static_cast<size_t>(layer)], *out, stream);
+        std::string profile_name = "prefill.layer." + std::to_string(layer) + ".total";
+        ProfileScope layer_profile(profile_name.c_str(), stream);
+        attention_decoder_layer_prefill(*in, ww, cos_table, sin_table,
+                                        row_to_t, prefill_shared, acfg,
+                                        state.layers[static_cast<size_t>(layer)], 0,
+                                        prefill_scratch, layer, *out, stream);
         std::swap(in, out);
     }
     state.seq_len = T;
@@ -391,8 +398,9 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
     Tensor logits({1, kChunkN}, DType::Float16); logits.allocate();
     Tensor chunk_best_value({1}, DType::Float16); chunk_best_value.allocate();
     Tensor chunk_best_index({1}, DType::Int32); chunk_best_index.allocate();
-    uint16_t chunk_best_value_host{0};
-    int32_t chunk_best_index_host{0};
+    const int64_t num_chunks = static_cast<int64_t>(w.lm_head_chunks.size());
+    Tensor chunk_best_values({num_chunks}, DType::Float16); chunk_best_values.allocate();
+    Tensor chunk_best_indices({num_chunks}, DType::Int32); chunk_best_indices.allocate();
 
     const bool use_w8a8 = w8a8_decode_enabled();
     Tensor logits_i32;
@@ -408,10 +416,8 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
         w8a8_quantize(normed, normed_i8, normed_scale, stream);
     }
 
-    int64_t best_token = 0;
-    float best_logit = -std::numeric_limits<float>::infinity();
-
-    for (const auto& chunk : w.lm_head_chunks) {
+    for (size_t chunk_idx = 0; chunk_idx < w.lm_head_chunks.size(); ++chunk_idx) {
+        const auto& chunk = w.lm_head_chunks[chunk_idx];
         if (use_w8a8 && chunk.weight_w8.w_int8.data() != nullptr) {
             matmul_w8a8_i32(normed_i8, chunk.weight_w8.w_int8, logits_i32, stream);
             w8a8_dequant(logits_i32, normed_scale, chunk.weight_w8.w_scale, logits, stream);
@@ -420,12 +426,31 @@ int64_t lm_head_greedy(const Tensor& last_hidden_1xH,
         }
         const int64_t valid = std::min<int64_t>(kChunkN, cfg.vocab_size - chunk.start_vocab);
         logits_top1(logits, valid, chunk_best_value, chunk_best_index, stream);
-        chunk_best_value.copy_to_host(&chunk_best_value_host, sizeof(chunk_best_value_host));
-        chunk_best_index.copy_to_host(&chunk_best_index_host, sizeof(chunk_best_index_host));
-        float v = h16_to_f32(chunk_best_value_host);
+        check_acl(aclrtMemcpyAsync(static_cast<uint8_t*>(chunk_best_values.data()) + chunk_idx * dtype_size(DType::Float16),
+                                   dtype_size(DType::Float16),
+                                   chunk_best_value.data(), dtype_size(DType::Float16),
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                  "lm_head collect chunk value");
+        check_acl(aclrtMemcpyAsync(static_cast<uint8_t*>(chunk_best_indices.data()) + chunk_idx * dtype_size(DType::Int32),
+                                   dtype_size(DType::Int32),
+                                   chunk_best_index.data(), dtype_size(DType::Int32),
+                                   ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+                  "lm_head collect chunk index");
+    }
+    check_acl(aclrtSynchronizeStream(stream), "lm_head chunk top1 sync");
+
+    std::vector<uint16_t> chunk_best_value_host(static_cast<size_t>(num_chunks));
+    std::vector<int32_t> chunk_best_index_host(static_cast<size_t>(num_chunks));
+    chunk_best_values.copy_to_host(chunk_best_value_host.data(), chunk_best_value_host.size() * sizeof(uint16_t));
+    chunk_best_indices.copy_to_host(chunk_best_index_host.data(), chunk_best_index_host.size() * sizeof(int32_t));
+
+    int64_t best_token = 0;
+    float best_logit = -std::numeric_limits<float>::infinity();
+    for (size_t chunk_idx = 0; chunk_idx < w.lm_head_chunks.size(); ++chunk_idx) {
+        const float v = h16_to_f32(chunk_best_value_host[chunk_idx]);
         if (v > best_logit) {
             best_logit = v;
-            best_token = chunk.start_vocab + chunk_best_index_host;
+            best_token = w.lm_head_chunks[chunk_idx].start_vocab + chunk_best_index_host[chunk_idx];
         }
     }
     return best_token;
@@ -446,8 +471,14 @@ int64_t decode_step_greedy(int32_t token_id,
         throw std::runtime_error("decode_step_greedy state layer count mismatch");
     }
 
-    Tensor hidden_a({1, cfg.hidden_size}, DType::Float16); hidden_a.allocate();
-    Tensor hidden_b({1, cfg.hidden_size}, DType::Float16); hidden_b.allocate();
+    if (state.hidden_a.shape() != std::vector<int64_t>{1, cfg.hidden_size}) {
+        state.hidden_a = Tensor({1, cfg.hidden_size}, DType::Float16);
+        state.hidden_b = Tensor({1, cfg.hidden_size}, DType::Float16);
+        state.hidden_a.allocate();
+        state.hidden_b.allocate();
+    }
+    Tensor& hidden_a = state.hidden_a;
+    Tensor& hidden_b = state.hidden_b;
     {
         ProfileScope profile_embed("decode.embedding", stream);
         embedding_lookup(w.embed, {token_id}, hidden_a, stream);

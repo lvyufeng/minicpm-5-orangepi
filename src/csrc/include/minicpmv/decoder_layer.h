@@ -1,5 +1,6 @@
 #pragma once
 
+#include "minicpmv/ops.h"
 #include "minicpmv/quantized_weight.h"
 #include "minicpmv/tensor.h"
 
@@ -46,8 +47,49 @@ struct AttentionDecoderLayerWeights {
     const W8A8QuantizedWeight* down_proj_w8{nullptr};
 };
 
+struct PrefillAttentionShared {
+    Tensor scale;
+    Tensor causal_mask;
+    std::vector<int32_t> q_row_to_t;
+    std::vector<int32_t> k_row_to_t;
+};
+
+struct PrefillLayerScratch {
+    Tensor normed;
+    Tensor q_full;
+    Tensor k_full;
+    Tensor v_full;
+    Tensor q_heads;
+    Tensor k_heads;
+    Tensor q_rope;
+    Tensor k_rope;
+    RopeScratch q_rope_scratch;
+    RopeScratch k_rope_scratch;
+    Tensor attn_out;
+    Tensor q_seq;
+    Tensor k_seq;
+    Tensor v_seq;
+    Tensor scores;
+    Tensor scaled_scores;
+    Tensor masked_scores;
+    Tensor probs;
+    Tensor ctx_seq;
+    Tensor attn_proj;
+    Tensor after_attn;
+    Tensor mlp_in;
+    Tensor gate;
+    Tensor up;
+    Tensor gated;
+    Tensor mlp_out;
+};
+
 struct AttentionLayerScratch {
     Tensor normed;
+    Tensor q_full;
+    Tensor k_full;
+    Tensor v_full;
+    Tensor normed_i8;
+    Tensor normed_scale;
     Tensor q_heads;
     Tensor k_heads;
     Tensor q_rope;
@@ -55,6 +97,8 @@ struct AttentionLayerScratch {
     Tensor attn_proj;
     Tensor after_attn;
     Tensor mlp_in;
+    Tensor mlp_i8;
+    Tensor mlp_scale;
     Tensor gate;
     Tensor up;
     Tensor gated;
@@ -70,6 +114,8 @@ struct AttentionLayerCache {
 struct DecodeState {
     int64_t max_seq_len{0};
     int64_t seq_len{0};
+    Tensor hidden_a;
+    Tensor hidden_b;
     std::vector<AttentionLayerCache> layers;
 };
 
@@ -77,6 +123,24 @@ DecodeState make_decode_state(int64_t max_seq_len,
                               int64_t num_layers,
                               const AttentionDecoderLayerConfig& config,
                               aclrtStream stream);
+
+void build_prefill_attention_shared(const std::vector<int32_t>& row_to_t,
+                                    const AttentionDecoderLayerConfig& config,
+                                    PrefillAttentionShared& shared);
+
+void attention_decoder_layer_prefill(const Tensor& hidden,
+                                     const AttentionDecoderLayerWeights& weights,
+                                     const Tensor& cos_table,
+                                     const Tensor& sin_table,
+                                     const std::vector<int32_t>& row_to_t,
+                                     const PrefillAttentionShared& shared,
+                                     const AttentionDecoderLayerConfig& config,
+                                     AttentionLayerCache& cache,
+                                     int64_t cache_offset,
+                                     PrefillLayerScratch& scratch,
+                                     int64_t layer_index,
+                                     Tensor& out,
+                                     aclrtStream stream);
 
 void attention_decoder_layer_with_cache(const Tensor& hidden,
                                         const AttentionDecoderLayerWeights& weights,

@@ -5,10 +5,12 @@
 
 #include <acl/acl.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,6 +18,47 @@
 
 namespace minicpmv {
 namespace {
+
+bool profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MINICPM_PROFILE");
+        return v != nullptr && *v != '\0' && std::string(v) != "0" && std::string(v) != "false";
+    }();
+    return enabled;
+}
+
+class ProfileScope {
+public:
+    ProfileScope(std::string name, aclrtStream stream) : name_(std::move(name)), stream_(stream), enabled_(profile_enabled()) {
+        if (enabled_) {
+            check_acl(aclrtSynchronizeStream(stream_), "profile sync start");
+            start_ = Clock::now();
+        }
+    }
+
+    ~ProfileScope() {
+        if (!enabled_) return;
+        auto ret = aclrtSynchronizeStream(stream_);
+        const auto end = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+        if (ret == ACL_SUCCESS) {
+            std::cerr << "# profile " << name_ << " ms=" << ms << '\n';
+        } else {
+            std::cerr << "# profile " << name_ << " sync_error=" << ret << " ms=" << ms << '\n';
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    std::string name_;
+    aclrtStream stream_;
+    bool enabled_;
+    Clock::time_point start_;
+};
+
+std::string prefill_profile_name(int64_t layer, const char* stage) {
+    return "prefill.layer." + std::to_string(layer) + "." + stage;
+}
 
 bool w8a8_decode_enabled() {
     static const bool enabled = [] {
@@ -97,21 +140,15 @@ void copy_seq_to_head_block(const Tensor& src_seq, Tensor& dst, int64_t col_offs
 
 void copy_heads_from_cols(const Tensor& src, int64_t heads, int64_t head_dim,
                           Tensor& dst, aclrtStream stream) {
-    const int64_t rows = src.shape()[0];
-    const int64_t src_cols = src.shape()[1];
-    const size_t elem = dtype_size(src.dtype());
-    const size_t src_row_bytes = static_cast<size_t>(src_cols) * elem;
-    const size_t head_bytes = static_cast<size_t>(head_dim) * elem;
-    auto* s = static_cast<const uint8_t*>(src.data());
-    auto* d = static_cast<uint8_t*>(dst.data());
-    for (int64_t t = 0; t < rows; ++t) {
-        for (int64_t h = 0; h < heads; ++h) {
-            check_acl(aclrtMemcpyAsync(d + static_cast<size_t>(t * heads + h) * head_bytes, head_bytes,
-                                       s + static_cast<size_t>(t) * src_row_bytes + static_cast<size_t>(h * head_dim) * elem,
-                                       head_bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
-                      "copy_heads_from_cols");
-        }
+    if (src.shape().size() != 2 || dst.shape().size() != 2 ||
+        src.shape()[1] != heads * head_dim ||
+        dst.shape() != std::vector<int64_t>{src.shape()[0] * heads, head_dim} ||
+        src.dtype() != dst.dtype()) {
+        throw std::runtime_error("copy_heads_from_cols shape mismatch");
     }
+    check_acl(aclrtMemcpyAsync(dst.data(), dst.size_bytes(), src.data(), src.size_bytes(),
+                               ACL_MEMCPY_DEVICE_TO_DEVICE, stream),
+              "copy_heads_from_cols");
 }
 
 void pack_heads_to_row(const Tensor& src_heads, Tensor& dst_row, int64_t heads,
@@ -244,16 +281,68 @@ void validate_shapes(const Tensor& hidden,
     }
 }
 
-void run_attention_core(const Tensor& hidden,
-                        const AttentionDecoderLayerWeights& weights,
-                        const Tensor& cos_table,
-                        const Tensor& sin_table,
-                        const std::vector<int32_t>& row_to_t,
-                        const AttentionDecoderLayerConfig& config,
-                        AttentionLayerCache* cache,
-                        int64_t cache_offset,
-                        Tensor& out,
-                        aclrtStream stream) {
+void ensure_prefill_scratch(PrefillLayerScratch& s,
+                            int64_t T,
+                            int64_t hidden_size,
+                            int64_t q_dim,
+                            int64_t kv_dim,
+                            int64_t num_q_heads,
+                            int64_t num_kv_heads,
+                            int64_t head_dim,
+                            int64_t intermediate) {
+    if (s.normed.shape() == std::vector<int64_t>{T, hidden_size} &&
+        s.q_full.shape() == std::vector<int64_t>{T, q_dim} &&
+        s.k_full.shape() == std::vector<int64_t>{T, kv_dim} &&
+        s.v_full.shape() == std::vector<int64_t>{T, kv_dim} &&
+        s.q_heads.shape() == std::vector<int64_t>{T * num_q_heads, head_dim} &&
+        s.k_heads.shape() == std::vector<int64_t>{T * num_kv_heads, head_dim} &&
+        s.gate.shape() == std::vector<int64_t>{T, intermediate}) {
+        return;
+    }
+    auto make = [](std::vector<int64_t> shape) {
+        Tensor t(std::move(shape), DType::Float16);
+        t.allocate();
+        return t;
+    };
+    s.normed = make({T, hidden_size});
+    s.q_full = make({T, q_dim});
+    s.k_full = make({T, kv_dim});
+    s.v_full = make({T, kv_dim});
+    s.q_heads = make({T * num_q_heads, head_dim});
+    s.k_heads = make({T * num_kv_heads, head_dim});
+    s.q_rope = make({T * num_q_heads, head_dim});
+    s.k_rope = make({T * num_kv_heads, head_dim});
+    s.attn_out = make({T, q_dim});
+    s.q_seq = make({T, head_dim});
+    s.k_seq = make({T, head_dim});
+    s.v_seq = make({T, head_dim});
+    s.scores = make({T, T});
+    s.scaled_scores = make({T, T});
+    s.masked_scores = make({T, T});
+    s.probs = make({T, T});
+    s.ctx_seq = make({T, head_dim});
+    s.attn_proj = make({T, hidden_size});
+    s.after_attn = make({T, hidden_size});
+    s.mlp_in = make({T, hidden_size});
+    s.gate = make({T, intermediate});
+    s.up = make({T, intermediate});
+    s.gated = make({T, intermediate});
+    s.mlp_out = make({T, hidden_size});
+}
+
+void run_prefill_core(const Tensor& hidden,
+                      const AttentionDecoderLayerWeights& weights,
+                      const Tensor& cos_table,
+                      const Tensor& sin_table,
+                      const std::vector<int32_t>& row_to_t,
+                      const PrefillAttentionShared& shared,
+                      const AttentionDecoderLayerConfig& config,
+                      AttentionLayerCache* cache,
+                      int64_t cache_offset,
+                      PrefillLayerScratch& scratch,
+                      int64_t layer_index,
+                      Tensor& out,
+                      aclrtStream stream) {
     validate_shapes(hidden, weights, config, out);
 
     const int64_t T = hidden.shape()[0];
@@ -273,6 +362,12 @@ void run_attention_core(const Tensor& hidden,
         cos_table.shape()[1] != config.rotary_dim / 2) {
         throw std::runtime_error("decoder layer RoPE table shape mismatch");
     }
+    if (shared.scale.shape() != std::vector<int64_t>{T, T} ||
+        shared.causal_mask.shape() != std::vector<int64_t>{T, T} ||
+        static_cast<int64_t>(shared.q_row_to_t.size()) != T * num_q_heads ||
+        static_cast<int64_t>(shared.k_row_to_t.size()) != T * num_kv_heads) {
+        throw std::runtime_error("prefill shared scale/mask/row map shape mismatch");
+    }
     if (cache != nullptr) {
         if (cache->k_cache.shape().size() != 2 || cache->v_cache.shape() != cache->k_cache.shape() ||
             cache->k_cache.shape()[1] != kv_dim) {
@@ -283,34 +378,43 @@ void run_attention_core(const Tensor& hidden,
         }
     }
 
-    Tensor normed({T, hidden_size}, DType::Float16); normed.allocate();
-    rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
+    ensure_prefill_scratch(scratch, T, hidden_size, q_dim, kv_dim,
+                           num_q_heads, num_kv_heads, head_dim, intermediate);
 
-    Tensor q_full({T, q_dim}, DType::Float16); q_full.allocate();
-    Tensor k_full({T, kv_dim}, DType::Float16); k_full.allocate();
-    Tensor v_full({T, kv_dim}, DType::Float16); v_full.allocate();
-    matmul_b_transposed(normed, *weights.q_proj_weight, q_full, stream);
-    matmul_b_transposed(normed, *weights.k_proj_weight, k_full, stream);
-    matmul_b_transposed(normed, *weights.v_proj_weight, v_full, stream);
-
-    Tensor q_heads({T * num_q_heads, head_dim}, DType::Float16); q_heads.allocate();
-    Tensor k_heads({T * num_kv_heads, head_dim}, DType::Float16); k_heads.allocate();
-    copy_heads_from_cols(q_full, num_q_heads, head_dim, q_heads, stream);
-    copy_heads_from_cols(k_full, num_kv_heads, head_dim, k_heads, stream);
-
-    std::vector<int32_t> q_row_to_t(static_cast<size_t>(T * num_q_heads));
-    std::vector<int32_t> k_row_to_t(static_cast<size_t>(T * num_kv_heads));
-    for (int64_t t = 0; t < T; ++t) {
-        for (int64_t h = 0; h < num_q_heads; ++h) q_row_to_t[static_cast<size_t>(t * num_q_heads + h)] = row_to_t[t];
-        for (int64_t h = 0; h < num_kv_heads; ++h) k_row_to_t[static_cast<size_t>(t * num_kv_heads + h)] = row_to_t[t];
+    Tensor& normed = scratch.normed;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "input_norm"), stream);
+        rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
     }
 
-    Tensor q_rope({T * num_q_heads, head_dim}, DType::Float16); q_rope.allocate();
-    Tensor k_rope({T * num_kv_heads, head_dim}, DType::Float16); k_rope.allocate();
-    apply_rope_partial(q_heads, cos_table, sin_table, q_row_to_t, config.rotary_dim, q_rope, stream);
-    apply_rope_partial(k_heads, cos_table, sin_table, k_row_to_t, config.rotary_dim, k_rope, stream);
+    Tensor& q_full = scratch.q_full;
+    Tensor& k_full = scratch.k_full;
+    Tensor& v_full = scratch.v_full;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "qkv"), stream);
+        matmul_b_transposed(normed, *weights.q_proj_weight, q_full, stream);
+        matmul_b_transposed(normed, *weights.k_proj_weight, k_full, stream);
+        matmul_b_transposed(normed, *weights.v_proj_weight, v_full, stream);
+    }
+
+    Tensor& q_heads = scratch.q_heads;
+    Tensor& k_heads = scratch.k_heads;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "head_pack"), stream);
+        copy_heads_from_cols(q_full, num_q_heads, head_dim, q_heads, stream);
+        copy_heads_from_cols(k_full, num_kv_heads, head_dim, k_heads, stream);
+    }
+
+    Tensor& q_rope = scratch.q_rope;
+    Tensor& k_rope = scratch.k_rope;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "rope"), stream);
+        apply_rope_prefill(q_heads, cos_table, sin_table, num_q_heads, config.rotary_dim, q_rope, stream);
+        apply_rope_prefill(k_heads, cos_table, sin_table, num_kv_heads, config.rotary_dim, k_rope, stream);
+    }
 
     if (cache != nullptr) {
+        ProfileScope p(prefill_profile_name(layer_index, "cache_write"), stream);
         const size_t elem = dtype_size(k_rope.dtype());
         const size_t head_bytes = static_cast<size_t>(head_dim) * elem;
         const size_t row_bytes = static_cast<size_t>(kv_dim) * elem;
@@ -340,10 +444,83 @@ void run_attention_core(const Tensor& hidden,
         check_acl(aclrtSynchronizeStream(stream), "kv cache write sync");
     }
 
-    Tensor scale({T, T}, DType::Float16);
+    Tensor& attn_out = scratch.attn_out;
+
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "attn_heads"), stream);
+        if (T <= 256) {
+            const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            prefill_attention_custom(q_rope, k_rope, v_full, T, num_q_heads, num_kv_heads,
+                                     head_dim, attn_scale, attn_out, stream);
+        } else {
+            Tensor& q_seq = scratch.q_seq;
+            Tensor& k_seq = scratch.k_seq;
+            Tensor& v_seq = scratch.v_seq;
+            Tensor& scores = scratch.scores;
+            Tensor& scaled_scores = scratch.scaled_scores;
+            Tensor& masked_scores = scratch.masked_scores;
+            Tensor& probs = scratch.probs;
+            Tensor& ctx_seq = scratch.ctx_seq;
+            for (int64_t qh = 0; qh < num_q_heads; ++qh) {
+                const int64_t kvh = qh / q_per_kv;
+                copy_head_to_seq(q_rope, qh, num_q_heads, q_seq, stream);
+                copy_head_to_seq(k_rope, kvh, num_kv_heads, k_seq, stream);
+                copy_col_block(v_full, kvh * head_dim, v_seq, stream);
+                matmul_b_transposed(q_seq, k_seq, scores, stream);
+                mul(scores, shared.scale, scaled_scores, stream);
+                add(scaled_scores, shared.causal_mask, masked_scores, stream);
+                softmax_last_dim(masked_scores, probs, stream);
+                matmul(probs, v_seq, ctx_seq, stream);
+                copy_seq_to_head_block(ctx_seq, attn_out, qh * head_dim, stream);
+            }
+        }
+    }
+
+    Tensor& attn_proj = scratch.attn_proj;
+    Tensor& after_attn = scratch.after_attn;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "o_proj"), stream);
+        matmul_b_transposed(attn_out, *weights.o_proj_weight, attn_proj, stream);
+        add(hidden, attn_proj, after_attn, stream);
+    }
+
+    Tensor& mlp_in = scratch.mlp_in;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "mlp_norm"), stream);
+        rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
+    }
+
+    Tensor& gate = scratch.gate;
+    Tensor& up = scratch.up;
+    Tensor& gated = scratch.gated;
+    Tensor& mlp_out = scratch.mlp_out;
+    {
+        ProfileScope p(prefill_profile_name(layer_index, "mlp"), stream);
+        matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
+        matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
+        silu_mul(gate, up, gated, stream);
+        matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
+        add(after_attn, mlp_out, out, stream);
+    }
+}
+
+}  // namespace
+
+void build_prefill_attention_shared(const std::vector<int32_t>& row_to_t,
+                                    const AttentionDecoderLayerConfig& config,
+                                    PrefillAttentionShared& shared) {
+    const int64_t T = static_cast<int64_t>(row_to_t.size());
+    if (T <= 0) {
+        throw std::runtime_error("build_prefill_attention_shared requires non-empty row_to_t");
+    }
+    if (config.head_dim <= 0) {
+        throw std::runtime_error("build_prefill_attention_shared invalid head_dim");
+    }
+
     std::vector<uint16_t> scale_host(static_cast<size_t>(T * T),
-                                     f32_to_f16_bits(1.0f / std::sqrt(static_cast<float>(head_dim))));
-    scale.copy_from_host(scale_host.data(), scale_host.size() * sizeof(uint16_t));
+                                     f32_to_f16_bits(1.0f / std::sqrt(static_cast<float>(config.head_dim))));
+    shared.scale = Tensor({T, T}, DType::Float16);
+    shared.scale.copy_from_host(scale_host.data(), scale_host.size() * sizeof(uint16_t));
 
     std::vector<uint16_t> mask_host(static_cast<size_t>(T * T));
     for (int64_t r = 0; r < T; ++r) {
@@ -352,54 +529,37 @@ void run_attention_core(const Tensor& hidden,
                 f32_to_f16_bits(row_to_t[c] <= row_to_t[r] ? 0.0f : -65504.0f);
         }
     }
-    Tensor causal_mask({T, T}, DType::Float16);
-    causal_mask.copy_from_host(mask_host.data(), mask_host.size() * sizeof(uint16_t));
+    shared.causal_mask = Tensor({T, T}, DType::Float16);
+    shared.causal_mask.copy_from_host(mask_host.data(), mask_host.size() * sizeof(uint16_t));
 
-    Tensor attn_out({T, q_dim}, DType::Float16); attn_out.allocate();
-    Tensor q_seq({T, head_dim}, DType::Float16); q_seq.allocate();
-    Tensor k_seq({T, head_dim}, DType::Float16); k_seq.allocate();
-    Tensor v_seq({T, head_dim}, DType::Float16); v_seq.allocate();
-    Tensor scores({T, T}, DType::Float16); scores.allocate();
-    Tensor scaled_scores({T, T}, DType::Float16); scaled_scores.allocate();
-    Tensor masked_scores({T, T}, DType::Float16); masked_scores.allocate();
-    Tensor probs({T, T}, DType::Float16); probs.allocate();
-    Tensor ctx_seq({T, head_dim}, DType::Float16); ctx_seq.allocate();
-
-    for (int64_t qh = 0; qh < num_q_heads; ++qh) {
-        const int64_t kvh = qh / q_per_kv;
-        copy_head_to_seq(q_rope, qh, num_q_heads, q_seq, stream);
-        copy_head_to_seq(k_rope, kvh, num_kv_heads, k_seq, stream);
-        copy_col_block(v_full, kvh * head_dim, v_seq, stream);
-        matmul_b_transposed(q_seq, k_seq, scores, stream);
-        mul(scores, scale, scaled_scores, stream);
-        add(scaled_scores, causal_mask, masked_scores, stream);
-        softmax_last_dim(masked_scores, probs, stream);
-        matmul(probs, v_seq, ctx_seq, stream);
-        copy_seq_to_head_block(ctx_seq, attn_out, qh * head_dim, stream);
+    shared.q_row_to_t.resize(static_cast<size_t>(T * config.num_q_heads));
+    shared.k_row_to_t.resize(static_cast<size_t>(T * config.num_kv_heads));
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t h = 0; h < config.num_q_heads; ++h) {
+            shared.q_row_to_t[static_cast<size_t>(t * config.num_q_heads + h)] = row_to_t[static_cast<size_t>(t)];
+        }
+        for (int64_t h = 0; h < config.num_kv_heads; ++h) {
+            shared.k_row_to_t[static_cast<size_t>(t * config.num_kv_heads + h)] = row_to_t[static_cast<size_t>(t)];
+        }
     }
-
-    Tensor attn_proj({T, hidden_size}, DType::Float16); attn_proj.allocate();
-    matmul_b_transposed(attn_out, *weights.o_proj_weight, attn_proj, stream);
-
-    Tensor after_attn({T, hidden_size}, DType::Float16); after_attn.allocate();
-    add(hidden, attn_proj, after_attn, stream);
-
-    Tensor mlp_in({T, hidden_size}, DType::Float16); mlp_in.allocate();
-    rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
-
-    Tensor gate({T, intermediate}, DType::Float16); gate.allocate();
-    Tensor up({T, intermediate}, DType::Float16); up.allocate();
-    Tensor gated({T, intermediate}, DType::Float16); gated.allocate();
-    Tensor mlp_out({T, hidden_size}, DType::Float16); mlp_out.allocate();
-
-    matmul_b_transposed(mlp_in, *weights.gate_proj_weight, gate, stream);
-    matmul_b_transposed(mlp_in, *weights.up_proj_weight, up, stream);
-    silu_mul(gate, up, gated, stream);
-    matmul_b_transposed(gated, *weights.down_proj_weight, mlp_out, stream);
-    add(after_attn, mlp_out, out, stream);
 }
 
-}  // namespace
+void attention_decoder_layer_prefill(const Tensor& hidden,
+                                     const AttentionDecoderLayerWeights& weights,
+                                     const Tensor& cos_table,
+                                     const Tensor& sin_table,
+                                     const std::vector<int32_t>& row_to_t,
+                                     const PrefillAttentionShared& shared,
+                                     const AttentionDecoderLayerConfig& config,
+                                     AttentionLayerCache& cache,
+                                     int64_t cache_offset,
+                                     PrefillLayerScratch& scratch,
+                                     int64_t layer_index,
+                                     Tensor& out,
+                                     aclrtStream stream) {
+    run_prefill_core(hidden, weights, cos_table, sin_table, row_to_t, shared, config,
+                     &cache, cache_offset, scratch, layer_index, out, stream);
+}
 
 DecodeState make_decode_state(int64_t max_seq_len,
                               int64_t num_layers,
@@ -447,7 +607,13 @@ void ensure_step_scratch(AttentionLayerScratch& s,
                          int64_t num_kv_heads,
                          int64_t head_dim,
                          int64_t intermediate) {
-    if (s.normed.data() != nullptr) {
+    if (s.normed.shape() == std::vector<int64_t>{1, hidden_size} &&
+        s.q_full.shape() == std::vector<int64_t>{1, q_dim} &&
+        s.k_full.shape() == std::vector<int64_t>{1, kv_dim} &&
+        s.v_full.shape() == std::vector<int64_t>{1, kv_dim} &&
+        s.q_heads.shape() == std::vector<int64_t>{num_q_heads, head_dim} &&
+        s.k_heads.shape() == std::vector<int64_t>{num_kv_heads, head_dim} &&
+        s.gate.shape() == std::vector<int64_t>{1, intermediate}) {
         return;
     }
     auto make = [](std::vector<int64_t> shape) {
@@ -456,6 +622,12 @@ void ensure_step_scratch(AttentionLayerScratch& s,
         return t;
     };
     s.normed = make({1, hidden_size});
+    s.q_full = make({1, q_dim});
+    s.k_full = make({1, kv_dim});
+    s.v_full = make({1, kv_dim});
+    s.normed_i8 = Tensor({1, hidden_size}, DType::Int8);
+    s.normed_i8.allocate();
+    s.normed_scale = make({1});
     s.q_heads = make({num_q_heads, head_dim});
     s.k_heads = make({num_kv_heads, head_dim});
     s.q_rope = make({num_q_heads, head_dim});
@@ -463,6 +635,9 @@ void ensure_step_scratch(AttentionLayerScratch& s,
     s.attn_proj = make({1, hidden_size});
     s.after_attn = make({1, hidden_size});
     s.mlp_in = make({1, hidden_size});
+    s.mlp_i8 = Tensor({1, hidden_size}, DType::Int8);
+    s.mlp_i8.allocate();
+    s.mlp_scale = make({1});
     s.gate = make({1, intermediate});
     s.up = make({1, intermediate});
     s.gated = make({1, intermediate});
@@ -480,8 +655,11 @@ void attention_decoder_layer_with_cache(const Tensor& hidden,
                                         AttentionLayerCache& cache,
                                         Tensor& out,
                                         aclrtStream stream) {
-    run_attention_core(hidden, weights, cos_table, sin_table, row_to_t, config,
-                       &cache, 0, out, stream);
+    PrefillAttentionShared shared;
+    build_prefill_attention_shared(row_to_t, config, shared);
+    PrefillLayerScratch scratch;
+    attention_decoder_layer_prefill(hidden, weights, cos_table, sin_table, row_to_t,
+                                    shared, config, cache, 0, scratch, 0, out, stream);
 }
 
 void attention_decoder_layer_step(const Tensor& hidden,
@@ -526,90 +704,113 @@ void attention_decoder_layer_step(const Tensor& hidden,
     auto& s = cache.scratch;
 
     Tensor& normed = s.normed;
-    rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
+    {
+        ProfileScope p("decode.input_norm", stream);
+        rms_norm(hidden, *weights.input_norm_weight, normed, config.rms_epsilon, stream);
+    }
 
-    Tensor q_full({1, q_dim}, DType::Float16); q_full.allocate();
-    Tensor k_full({1, kv_dim}, DType::Float16); k_full.allocate();
-    Tensor v_full({1, kv_dim}, DType::Float16); v_full.allocate();
+    Tensor& q_full = s.q_full;
+    Tensor& k_full = s.k_full;
+    Tensor& v_full = s.v_full;
 
-    if (w8a8_weight_ready(weights.q_proj_w8) || w8a8_weight_ready(weights.k_proj_w8) ||
-        w8a8_weight_ready(weights.v_proj_w8)) {
-        Tensor normed_i8(normed.shape(), DType::Int8); normed_i8.allocate();
-        Tensor normed_scale({1}, DType::Float16); normed_scale.allocate();
-        w8a8_quantize(normed, normed_i8, normed_scale, stream);
-        if (w8a8_weight_ready(weights.q_proj_w8)) {
-            matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.q_proj_w8, q_full, stream);
+    {
+        ProfileScope p("decode.qkv", stream);
+        if (w8a8_weight_ready(weights.q_proj_w8) || w8a8_weight_ready(weights.k_proj_w8) ||
+            w8a8_weight_ready(weights.v_proj_w8)) {
+            Tensor& normed_i8 = s.normed_i8;
+            Tensor& normed_scale = s.normed_scale;
+            w8a8_quantize(normed, normed_i8, normed_scale, stream);
+            if (w8a8_weight_ready(weights.q_proj_w8)) {
+                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.q_proj_w8, q_full, stream);
+            } else {
+                matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, nullptr, q_full, stream);
+            }
+            if (w8a8_weight_ready(weights.k_proj_w8)) {
+                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.k_proj_w8, k_full, stream);
+            } else {
+                matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, nullptr, k_full, stream);
+            }
+            if (w8a8_weight_ready(weights.v_proj_w8)) {
+                matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.v_proj_w8, v_full, stream);
+            } else {
+                matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, nullptr, v_full, stream);
+            }
         } else {
             matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, nullptr, q_full, stream);
-        }
-        if (w8a8_weight_ready(weights.k_proj_w8)) {
-            matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.k_proj_w8, k_full, stream);
-        } else {
             matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, nullptr, k_full, stream);
-        }
-        if (w8a8_weight_ready(weights.v_proj_w8)) {
-            matmul_decode_w8a8_prequant(normed_i8, normed_scale, *weights.v_proj_w8, v_full, stream);
-        } else {
             matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, nullptr, v_full, stream);
         }
-    } else {
-        matmul_decode_dispatch(normed, weights.q_proj_weight, weights.q_proj_q, nullptr, q_full, stream);
-        matmul_decode_dispatch(normed, weights.k_proj_weight, weights.k_proj_q, nullptr, k_full, stream);
-        matmul_decode_dispatch(normed, weights.v_proj_weight, weights.v_proj_q, nullptr, v_full, stream);
     }
 
     Tensor& q_heads = s.q_heads;
     Tensor& k_heads = s.k_heads;
-    copy_heads_from_cols(q_full, num_q_heads, head_dim, q_heads, stream);
-    copy_heads_from_cols(k_full, num_kv_heads, head_dim, k_heads, stream);
+    {
+        ProfileScope p("decode.head_pack", stream);
+        copy_heads_from_cols(q_full, num_q_heads, head_dim, q_heads, stream);
+        copy_heads_from_cols(k_full, num_kv_heads, head_dim, k_heads, stream);
+    }
 
     Tensor& q_rope = s.q_rope;
-    rope_cache_write(q_heads, k_heads, v_full, cache.k_cache, cache.v_cache,
-                     cos_table, sin_table, pos, cache_len,
-                     num_q_heads, num_kv_heads, head_dim, config.rotary_dim,
-                     q_rope, stream);
+    {
+        ProfileScope p("decode.rope_cache_write", stream);
+        rope_cache_write(q_heads, k_heads, v_full, cache.k_cache, cache.v_cache,
+                         cos_table, sin_table, pos, cache_len,
+                         num_q_heads, num_kv_heads, head_dim, config.rotary_dim,
+                         q_rope, stream);
+    }
 
     Tensor& attn_out = s.attn_out;
-    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    incre_flash_attention(q_rope, cache.k_cache, cache.v_cache,
-                          context, num_q_heads, num_kv_heads, head_dim,
-                          attn_scale, attn_out, stream);
+    {
+        ProfileScope p("decode.ifa", stream);
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        incre_flash_attention(q_rope, cache.k_cache, cache.v_cache,
+                              context, num_q_heads, num_kv_heads, head_dim,
+                              attn_scale, attn_out, stream);
+    }
 
     Tensor& attn_proj = s.attn_proj;
-    matmul_decode_dispatch(attn_out, weights.o_proj_weight, weights.o_proj_q, weights.o_proj_w8, attn_proj, stream);
-
     Tensor& after_attn = s.after_attn;
-    add(hidden, attn_proj, after_attn, stream);
+    {
+        ProfileScope p("decode.o_proj", stream);
+        matmul_decode_dispatch(attn_out, weights.o_proj_weight, weights.o_proj_q, weights.o_proj_w8, attn_proj, stream);
+        add(hidden, attn_proj, after_attn, stream);
+    }
 
     Tensor& mlp_in = s.mlp_in;
-    rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
+    {
+        ProfileScope p("decode.mlp_norm", stream);
+        rms_norm(after_attn, *weights.post_attention_norm_weight, mlp_in, config.rms_epsilon, stream);
+    }
 
     Tensor& gate = s.gate;
     Tensor& up = s.up;
     Tensor& gated = s.gated;
     Tensor& mlp_out = s.mlp_out;
 
-    if (w8a8_weight_ready(weights.gate_proj_w8) || w8a8_weight_ready(weights.up_proj_w8)) {
-        Tensor mlp_i8(mlp_in.shape(), DType::Int8); mlp_i8.allocate();
-        Tensor mlp_scale({1}, DType::Float16); mlp_scale.allocate();
-        w8a8_quantize(mlp_in, mlp_i8, mlp_scale, stream);
-        if (w8a8_weight_ready(weights.gate_proj_w8)) {
-            matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.gate_proj_w8, gate, stream);
+    {
+        ProfileScope p("decode.mlp", stream);
+        if (w8a8_weight_ready(weights.gate_proj_w8) || w8a8_weight_ready(weights.up_proj_w8)) {
+            Tensor& mlp_i8 = s.mlp_i8;
+            Tensor& mlp_scale = s.mlp_scale;
+            w8a8_quantize(mlp_in, mlp_i8, mlp_scale, stream);
+            if (w8a8_weight_ready(weights.gate_proj_w8)) {
+                matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.gate_proj_w8, gate, stream);
+            } else {
+                matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, nullptr, gate, stream);
+            }
+            if (w8a8_weight_ready(weights.up_proj_w8)) {
+                matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.up_proj_w8, up, stream);
+            } else {
+                matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
+            }
         } else {
             matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, nullptr, gate, stream);
-        }
-        if (w8a8_weight_ready(weights.up_proj_w8)) {
-            matmul_decode_w8a8_prequant(mlp_i8, mlp_scale, *weights.up_proj_w8, up, stream);
-        } else {
             matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
         }
-    } else {
-        matmul_decode_dispatch(mlp_in, weights.gate_proj_weight, weights.gate_proj_q, nullptr, gate, stream);
-        matmul_decode_dispatch(mlp_in, weights.up_proj_weight, weights.up_proj_q, nullptr, up, stream);
+        silu_mul(gate, up, gated, stream);
+        matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, weights.down_proj_w8, mlp_out, stream);
+        add(after_attn, mlp_out, out, stream);
     }
-    silu_mul(gate, up, gated, stream);
-    matmul_decode_dispatch(gated, weights.down_proj_weight, weights.down_proj_q, weights.down_proj_w8, mlp_out, stream);
-    add(after_attn, mlp_out, out, stream);
 }
 
 }  // namespace minicpmv
