@@ -1,6 +1,6 @@
 # MiniCPM5-1B on Orange Pi Ascend 310B
 
-This repository contains a local inference runtime for running **MiniCPM5-1B** on Orange Pi boards with Ascend NPU support. It is focused on edge/on-device deployment: a lightweight C++ Ascend backend executes the model, and an optional FastAPI web demo provides a browser chat UI.
+This repository contains a local inference runtime for running **MiniCPM5-1B** on Orange Pi boards with Ascend 310B NPU support. It is focused on edge/on-device deployment: a lightweight C++ Ascend backend executes the model, and an optional FastAPI web demo provides a browser chat UI.
 
 The current local backend is **greedy-only**. The web UI keeps temperature/top-p controls for compatibility with the upstream MiniCPM5 demo, but those parameters are not applied by the C++ runtime yet.
 
@@ -101,10 +101,21 @@ cmake --build build --target minicpm5_server -j$(nproc)
 
 ## Performance
 
-- Current generation is greedy-only.
+Measured on the local Orange Pi Ascend 310B runtime with MiniCPM5-1B weights, `MAX_SEQ=4096`, `INPUT_IDS=0`, `MAX_NEW=16`, greedy decoding, and `MINICPM_PROFILE=1`.
+
+| Item | Measured value |
+| --- | ---: |
+| One-time weight load | 77.1 s |
+| Prefill + first lm_head, 1-token prompt | 801 ms |
+| Steady decode step, average over 15 generated tokens | 139 ms/token |
+| Steady decode throughput | 7.19 tokens/s |
+| One-shot CLI total time, including weight load | 80.0 s |
+
+Notes:
+
 - The local C++ backend consumes token IDs; Python handles tokenizer/chat-template formatting in the web demo.
 - The current default max sequence length for the Orange Pi runtime is `4096`.
-- The persistent backend avoids reloading weights on every request; the first request still pays the one-time warmup cost, later requests are much faster.
+- The persistent backend avoids reloading weights on every request; the weight-load cost is paid when `minicpm5_server` starts or restarts, not for every prompt.
 
 Persistent backend protocol example:
 
@@ -113,11 +124,9 @@ source scripts/set_env.sh
 printf 'REQUEST 8 0\n' | build/minicpm5_server --weights models/MiniCPM5-1B --max-seq 4096 --device-id 0
 ```
 
-## Acknowledgement
+## Acknowledgement and links
 
 Thanks to the upstream **MiniCPM** / **MiniCPM5** project and the Hugging Face demo for the reference model card, chat template behavior, and online demo UX.
-
-## Related links
 
 - MiniCPM5-1B model: https://huggingface.co/openbmb/MiniCPM5-1B
 - Online MiniCPM5-1B demo: https://huggingface.co/spaces/openbmb/MiniCPM5-1B-Demo

@@ -1,6 +1,6 @@
 # MiniCPM5-1B 香橙派 Ascend 310B 本地运行时
 
-本仓库用于在带 Ascend NPU 支持的香橙派设备上本地运行 **MiniCPM5-1B**。目标是端侧 / 本地部署：底层使用轻量 C++ Ascend 推理后端执行模型，可选的 FastAPI Web Demo 提供浏览器聊天界面。
+本仓库用于在带 Ascend 310B NPU 支持的香橙派设备上本地运行 **MiniCPM5-1B**。目标是端侧 / 本地部署：底层使用轻量 C++ Ascend 推理后端执行模型，可选的 FastAPI Web Demo 提供浏览器聊天界面。
 
 当前本地后端是 **greedy-only**。Web UI 保留 temperature/top-p 控件是为了兼容上游 MiniCPM5 Demo，但这些参数目前还不会作用到 C++ runtime。
 
@@ -101,10 +101,21 @@ cmake --build build --target minicpm5_server -j$(nproc)
 
 ## Performance
 
-- 当前生成方式是 greedy-only。
+以下数据在本地香橙派 Ascend 310B runtime 上实测，使用 MiniCPM5-1B 权重、`MAX_SEQ=4096`、`INPUT_IDS=0`、`MAX_NEW=16`、greedy decode，并开启 `MINICPM_PROFILE=1`。
+
+| 项目 | 实测数据 |
+| --- | ---: |
+| 一次性权重加载 | 77.1 s |
+| 1-token prompt 的 prefill + first lm_head | 801 ms |
+| 稳态 decode step，15 个生成 token 平均 | 139 ms/token |
+| 稳态 decode 吞吐 | 7.19 tokens/s |
+| 一次性 CLI 总耗时，包含权重加载 | 80.0 s |
+
+说明：
+
 - 本地 C++ 后端消费 token ID；Web Demo 中由 Python 负责 tokenizer / chat-template 格式化。
 - 当前香橙派 runtime 默认最大序列长度为 `4096`。
-- 常驻后端不会在每次请求时重新加载权重；第一次请求仍然有一次性 warmup 开销，后续请求会快很多。
+- 常驻后端不会在每次请求时重新加载权重；权重加载开销发生在 `minicpm5_server` 启动或重启时，而不是每个 prompt 都重新加载。
 
 常驻后端协议示例：
 
@@ -113,11 +124,9 @@ source scripts/set_env.sh
 printf 'REQUEST 8 0\n' | build/minicpm5_server --weights models/MiniCPM5-1B --max-seq 4096 --device-id 0
 ```
 
-## Acknowledgement
+## Acknowledgement and links
 
 感谢上游 **MiniCPM** / **MiniCPM5** 项目和 Hugging Face demo 提供的参考模型卡、chat template 行为以及在线 Demo 交互方式。
-
-## 相关链接
 
 - MiniCPM5-1B 模型：https://huggingface.co/openbmb/MiniCPM5-1B
 - MiniCPM5-1B 在线 Demo：https://huggingface.co/spaces/openbmb/MiniCPM5-1B-Demo
