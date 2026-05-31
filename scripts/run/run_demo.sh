@@ -27,4 +27,4 @@ export BUILD_DIR WEIGHTS HOST PORT MAX_SEQ MAX_NEW TOKENIZER
 export USE_TORCH=${USE_TORCH:-0}
 export MINICPM5_SERVER_BIN="$REPO_ROOT/$BUILD_DIR/minicpm5_server"
 
-python3 -m uvicorn app:app --host "$HOST" --port "$PORT"
+python3 -m uvicorn demo.app:app --host "$HOST" --port "$PORT"

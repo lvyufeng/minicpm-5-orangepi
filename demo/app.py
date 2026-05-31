@@ -24,7 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
-REPO_ROOT = Path(__file__).resolve().parent
+DEMO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = DEMO_ROOT.parent
 BUILD_DIR = Path(os.environ.get("BUILD_DIR", REPO_ROOT / "build"))
 BACKEND_BIN = Path(os.environ.get("MINICPM5_SERVER_BIN", BUILD_DIR / "minicpm5_server"))
 WEIGHTS = os.environ.get("WEIGHTS", os.environ.get("MINICPM5_MODEL_PATH", str(REPO_ROOT / "models" / "MiniCPM5-1B")))
@@ -35,8 +36,8 @@ DEVICE_ID = int(os.environ.get("DEVICE_ID", "0"))
 
 app = FastAPI(title="MiniCPM5-1B OrangePi Demo")
 
-if (REPO_ROOT / "assets").exists():
-    app.mount("/assets", StaticFiles(directory=REPO_ROOT / "assets"), name="assets")
+if (DEMO_ROOT / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=DEMO_ROOT / "assets"), name="assets")
 
 _tokenizer = None
 _current_process: subprocess.Popen[str] | None = None
@@ -254,7 +255,7 @@ async def startup_backend() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    index_path = REPO_ROOT / "index.html"
+    index_path = DEMO_ROOT / "index.html"
     if not index_path.exists():
         return "<h1>MiniCPM5 Demo</h1><p>index.html missing.</p>"
     return index_path.read_text(encoding="utf-8")
